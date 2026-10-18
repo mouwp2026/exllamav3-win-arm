@@ -1,0 +1,115 @@
+# Rolling pre-release so master users never have to build the extension by hand: one Linux wheel
+# per push to master, attached to the fixed pre-release tag `nightly` and replaced on every run.
+# Single combo on purpose (the same fat arch list as the release matrix, so it runs on any
+# Ampere-and-newer card) -- anything larger belongs in build.yml.
+name: Nightly wheel
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - 'exllamav3/**'
+      - 'setup.py'
+      - 'pyproject.toml'
+      - 'requirements.txt'
+      - '.github/workflows/nightly.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nightly
+  cancel-in-progress: true
+
+env:
+  NIGHTLY_TAG: nightly
+  # Fat arch list, same as the release matrix: 8.0 8.6 8.9 9.0 10.0 12.0+PTX
+  TORCH_CUDA_ARCH_LIST: '8.0 8.6 8.9 9.0 10.0 12.0+PTX'
+  TORCH_VERSION: '2.11.0'
+
+jobs:
+  nightly:
+    name: Build nightly linux wheel (py3.12, cu128)
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Free Disk Space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          swap-storage: true
+
+      - uses: actions/checkout@v4
+
+      - name: Install Linux CUDA 12.8.1
+        uses: Jimver/cuda-toolkit@v0.2.35
+        with:
+          cuda: "12.8.1"
+          linux-local-args: '["--toolkit"]'
+          method: "network"
+
+      - name: Install the latest version of uv and set the python version
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install torch and the build/runtime dependencies
+        run: |
+          uv pip install torch==${{ env.TORCH_VERSION }} --index-url https://download.pytorch.org/whl/cu128
+          # pip itself has to be installed explicitly: setup-uv provides the interpreter, not pip,
+          # and the steps below run `python -m pip`
+          uv pip install --upgrade pip build "setuptools==84.0.0" wheel packaging ninja \
+            "safetensors>=0.3.2" tokenizers "numpy>=2.1.0" rich typing_extensions pillow pyyaml \
+            marisa_trie pydantic "llguidance>=1.7.0"
+
+      - name: Build wheel
+        # Build tag keeps the asset distinct from a release wheel of the same version, and
+        # --no-build-isolation keeps torch visible to setup.py
+        run: python -m build -n --wheel -C--build-option=egg_info "-C--build-option=--tag-build=+cu128-torch${{ env.TORCH_VERSION }}"
+
+      - name: Install the built wheel
+        run: |
+          ls -l dist
+          python -m pip install --no-deps --force-reinstall dist/*.whl
+          python -m pip show exllamav3
+
+      - name: Import smoke test
+        # From a neutral directory so `import exllamav3` resolves to the installed wheel rather
+        # than to the source tree checked out in the working directory
+        working-directory: ${{ runner.temp }}
+        run: |
+          python -c "import exllamav3; print('import ok:', exllamav3.__file__)"
+          python -c "from exllamav3.version import __version__; print('exllamav3', __version__)"
+
+      - name: Publish to the rolling nightly pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="$(sed -nE 's/^__version__[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' exllamav3/version.py | head -1)"
+          tag="${{ env.NIGHTLY_TAG }}"
+          if ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --prerelease \
+              --title "Nightly (rolling)" --target "$GITHUB_SHA" \
+              --notes "Rolling pre-release built from master. One Linux wheel per push, with the fat CUDA arch list 8.0 8.6 8.9 9.0 10.0 12.0+PTX. Assets are replaced on every run."
+          fi
+          # Clobber everything that is there now, so a version bump cannot leave a stale wheel
+          # behind next to the new one
+          mapfile -t stale < <(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name')
+          if [ "${#stale[@]}" -gt 0 ]; then
+            for asset in "${stale[@]}"; do
+              echo "Removing stale asset $asset"
+              gh release delete-asset "$tag" "$asset" --repo "$GITHUB_REPOSITORY" -y
+            done
+          fi
+          gh release upload "$tag" dist/*.whl --repo "$GITHUB_REPOSITORY" --clobber
+          gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json tagName,isPrerelease,assets \
+            -q '(.tagName) + " prerelease=" + (.isPrerelease | tostring) + ": " + ([.assets[] | .name + " (" + (.size | tostring) + " bytes)"] | join(", "))'

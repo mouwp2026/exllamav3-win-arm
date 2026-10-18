@@ -1,0 +1,120 @@
+# Cheap merge gate: one Linux job, one CUDA arch, no GPU. It answers one question -- does a
+# clean tree still build the extension into a wheel and import? -- for the paths that can break
+# it. The full OS/Python/torch/CUDA matrix, the Windows builds and the release assets stay in
+# build.yml (tag push or manual dispatch); the rolling pre-release is nightly.yml.
+name: CI
+
+on:
+  pull_request:
+    paths:
+      - 'exllamav3/**'
+      - 'tests/**'
+      - 'setup.py'
+      - 'pyproject.toml'
+      - 'requirements.txt'
+      - '.github/workflows/**'
+  push:
+    branches:
+      - master
+    paths:
+      - 'exllamav3/**'
+      - 'tests/**'
+      - 'setup.py'
+      - 'pyproject.toml'
+      - 'requirements.txt'
+      - '.github/workflows/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-wheel:
+    name: Build linux wheel (py3.12, cu128, sm_120)
+    runs-on: ubuntu-22.04
+    env:
+      # One arch only: this job proves the build works, it is not a distributable artifact
+      TORCH_CUDA_ARCH_LIST: '12.0'
+    steps:
+      - name: Free Disk Space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          swap-storage: true
+
+      - uses: actions/checkout@v4
+
+      - name: Install Linux CUDA 12.8.1
+        uses: Jimver/cuda-toolkit@v0.2.35
+        with:
+          cuda: "12.8.1"
+          linux-local-args: '["--toolkit"]'
+          method: "network"
+
+      - name: Install the latest version of uv and set the python version
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install torch and the build/runtime dependencies
+        run: |
+          uv pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu128
+          # Same pins as build.yml, plus pytest and the runtime requirements the import needs,
+          # so the wheel can be installed with --no-deps and nothing is resolved from PyPI
+          uv pip install --upgrade pip build "setuptools==84.0.0" wheel packaging ninja pytest \
+            "safetensors>=0.3.2" tokenizers "numpy>=2.1.0" rich typing_extensions pillow pyyaml \
+            marisa_trie pydantic "llguidance>=1.7.0"
+
+      - name: Build wheel
+        # --no-build-isolation: setup.py only compiles the extension when it can see torch
+        run: python -m pip wheel . --no-deps --no-build-isolation -w dist
+
+      - name: Install the built wheel
+        run: |
+          ls -l dist
+          python -m pip install --no-deps --force-reinstall dist/*.whl
+          python -m pip show exllamav3
+
+      - name: Import smoke test
+        # From a neutral directory: run from the repo root and `import exllamav3` resolves to the
+        # source tree instead of the wheel that was just installed, which is the thing this gate
+        # is meant to prove. exllamav3/__init__.py does not re-export __version__, so read it
+        # from the module the packaging metadata is generated from, and check the dist metadata.
+        working-directory: ${{ runner.temp }}
+        run: |
+          python -c "import exllamav3; print('import ok:', exllamav3.__file__)"
+          python -c "from exllamav3.version import __version__; print('exllamav3', __version__)"
+          python -c "from importlib.metadata import version; print('installed dist version:', version('exllamav3'))"
+
+      - name: Run the CPU-only tests
+        # tests/ has 55 modules and most need a CUDA device and the compiled extension to be
+        # executable, which a hosted runner has no GPU for. These four read sources or build
+        # tensors on the CPU and are green on master; they include the half-bit ABI guard for
+        # the mixed-K MoE path (test_mixedk_merge_abi), which re-reads block_sparse_mlp.py.
+        run: |
+          python -m pytest --noconftest -q \
+            tests/test_mixedk_merge_abi.py \
+            tests/conversion/test_optimizer_targets.py \
+            tests/test_draft_confidence_env_.py \
+            tests/test_attn_fullgate_cpu.py
+
+      - name: Run the CPU source tests for memory, draft reserve, batch verification and token budgets
+        # Separate step on purpose: these read sources and execute against stub devices,
+        # fake procfs and CPU tensors. No GPU or built extension is needed; --noconftest
+        # excludes the shared CUDA fixture, and a separate process keeps source-harness
+        # stubs out of the wheel/import checks above. The token-budget cases cover
+        # producer-owned finite and natural-only phase transitions.
+        run: |
+          python -m pytest --noconftest -q \
+            tests/test_uma_budget_cpu.py \
+            tests/test_dflash_page_reserve_cpu.py \
+            tests/test_sampler_batch_verify_cpu.py \
+            tests/test_token_budget_cpu.py \
+            tests/conversion/test_calibration_batching_cpu.py
