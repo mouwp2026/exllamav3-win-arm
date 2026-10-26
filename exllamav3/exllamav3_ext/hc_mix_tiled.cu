@@ -63,6 +63,13 @@ det_quant_weight). Workspaces are sized by the caller from gr_mix_tiled_slices()
 #define GATE_TD 32
 #define GATE_KCH 64
 #define GATE_THREADS 256
+// Blocks per SM for the gate kernel. 144 registers pinned it to one block, which
+// serialises the int8 GEMM (compute bound) against the mixed epilogue (bandwidth
+// bound). GATE_SMEM is only 48 KB, so two blocks fit; the probe compiles this file
+// with -DGATE_MIN_BLOCKS=2 to measure the overlap.
+#ifndef GATE_MIN_BLOCKS
+#define GATE_MIN_BLOCKS 2
+#endif
 #define GATE_A_BYTES (2 * GATE_BM * GATE_KCH)
 #define GATE_B_BYTES (2 * HC * GATE_TD * GATE_KCH)
 #define GATE_STAGE_BYTES (GATE_A_BYTES + GATE_B_BYTES)
@@ -333,7 +340,7 @@ void gr_latent_i8
 // ---------------------------------------------------------------------------------------------
 // 3. gate: block = 64 rows x [HC x 32 d], 8 warps (wm, h) with 32 x 32 warp tiles, K = LR
 
-__global__ __launch_bounds__(GATE_THREADS)
+__global__ __launch_bounds__(GATE_THREADS, GATE_MIN_BLOCKS)
 void gr_gate_i8
 (
     const float* __restrict__ s,        // (R, HC * D)
@@ -645,3 +652,379 @@ void gr_mix_tiled
     gr_gate_i8<<<grid_c, GATE_THREADS, GATE_SMEM, stream>>>(s_p, rmr_p, w_p, thi, tlo, ts_p, uhi, ulo, (const float*) up_sb.data_ptr(), mixed_p, R, D, LR);
     cuda_check(cudaPeekAtLastError());
 }
+
+
+// =============================================================================================
+// fp16 dots path (M2f): gr_dots_f16 + gr_mix_tiled_f16. CUDA only; the int8 path above stays
+// the ROCm route and remains reachable with EXL3_GR_F16_DOTS=0.
+// =============================================================================================
+#if !defined(USE_ROCM)
+// fp16 replacement for gr_dots_i8, shipped (EXL3_GR_F16_DOTS, hyperconnections.py).
+//
+// Why: the int8 Ozaki scheme runs det_mma3 -- three mma.m16n8k32 per k32 step --
+// to buy exact cross-architecture determinism. In this model that costs:
+//   * 3x the MMA instructions (an m16n8k32 s8 does 4096 MAC, an m16n8k16 f16 2048,
+//     and f16 tensor cores run at half the s8 rate, so 3 passes = 1.5x the time)
+//   * a per-(row,128) amax + det_quant16 + hi/lo double smem store on the A side
+// while the operand bytes are identical (proj int8 hi/lo = 2*Mpad*HD = 7.9 MB,
+// proj fp16 = Mpad*HD*2 = 7.9 MB).
+//
+// Layout, grid and warp tiling are unchanged from gr_dots_i8 so the two can be
+// A/B'd directly. Only the pieces differ: 256-byte fp16 rows (16 x 16B) instead of
+// 128-byte int8 rows (8 x 16B), so the swizzle becomes c ^ (r & 7) over 16 pieces.
+
+#define F16_A_BYTES (DOTS_BM * DOTS_KCH * 2)
+#define F16_B_BYTES (DOTS_BN * DOTS_KCH * 2)
+#define F16_STAGE_BYTES (F16_A_BYTES + F16_B_BYTES)
+#define F16_DOTS_SMEM (DOTS_STAGES * F16_STAGE_BYTES)
+
+// 16-byte piece c (0..15) of row r in a 256-byte fp16 row, XOR-swizzled across the
+// 8 bank groups: rows r and r+8 land on different banks for the same piece.
+__device__ __forceinline__ int f16_swz256(int r, int c) { return r * 256 + ((c ^ (r & 7)) << 4); }
+// Same for 128-byte fp16 rows (8 pieces), used by the gate kernel.
+__device__ __forceinline__ int f16_swz128(int r, int c) { return r * 128 + ((c ^ (r & 7)) << 4); }
+
+#if !defined(USE_ROCM)
+// A fragment for one m16n8k16 tile: 16 rows x 16 k. Same lane map as det_load_a,
+// which already produces the {m0-15,k0-7},{m0-15,k8-15} order mma expects.
+__device__ __forceinline__ void f16_load_a(unsigned* frag, unsigned base, int row0, int kpiece0, int lane)
+{
+    const int row = row0 + (lane & 7) + ((lane >> 3) & 1) * 8;
+    det_ldmatrix_x4(frag, base + f16_swz256(row, kpiece0 + (lane >> 4)));
+}
+
+// B fragment for one m16n8k16 tile: k16 x n8.
+//
+// No .trans here, and that is not an oversight. B lives (n, k) row-major in smem,
+// which is bit-for-bit the (k, n) column-major layout mma.m16n8k16.row.col wants;
+// ldmatrix's plain lane map (lane l -> matrix[l/4][(l%4)*2], two halves) then hands
+// lane l exactly B[k=(l%4)*2][n=l/4], which is the fragment layout PTX specifies.
+// Adding .trans transposes it a second time and computes A @ B instead of A @ B^T --
+// measured as a full-magnitude but wrong result.
+__device__ __forceinline__ void f16_load_b(unsigned* frag, unsigned base, int n0, int kpiece0, int lane)
+{
+    const int n = n0 + (lane & 7);
+    const int kseg = (lane >> 3) & 1;
+    const unsigned addr = base + f16_swz256(n, kpiece0 + kseg);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
+                 : "=r"(frag[0]), "=r"(frag[1]) : "r"(addr));
+}
+
+__device__ __forceinline__ void mma_f16(float* c, const unsigned* a, const unsigned* b)
+{
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+#endif
+
+// gr_dots_f16: dm_part[slice] = (normed @ proj^T) over one k slice, plus the slice's
+// sum of squares. proj is fp16 (Mpad, HD); no per-row scale, no activation scale.
+//
+// The ", 2" is load-bearing. At 88 registers the kernel needs 88*512 = 45k of the SM's
+// 64k register file, so only one block fits no matter how little smem it asks for --
+// 16 warps resident out of 64, and the A-side stream read drops to ~98 GB/s (well under
+// the 226 GB/s a plain fp32->fp16 pass reaches on this part). Asking for two blocks
+// forces the compiler under 64 registers and doubles the resident warps.
+__global__ __launch_bounds__(DOTS_THREADS, 2)
+void gr_dots_f16
+(
+    const float* __restrict__ s,        // (R, HC * D)
+    const half* __restrict__ w,         // (HC * D) fp16 norm weight (includes +1)
+    const half* __restrict__ proj,      // (Mpad, HC * D) fp16
+    float* __restrict__ dm_part,        // (S, Rpad, Mpad)
+    float* __restrict__ ss_part,        // (S, Rpad)
+    const int R, const int D, const int Mpad, const int kslice
+)
+{
+    extern __shared__ __align__(128) unsigned char dsm[];
+    const int HD = HC * D;
+    const int t = threadIdx.x, warp = t / 32, lane = t % 32;
+    const int wm = warp / 8, wn = warp % 8;
+    const int g = lane / 4, tg = lane % 4;
+    const int n0 = blockIdx.x * DOTS_BN, r0 = blockIdx.y * DOTS_BM;
+    const int slice = blockIdx.z;
+    const int k_beg = slice * kslice, k_end = k_beg + kslice;
+    const int n_stages = kslice / DOTS_KCH;
+    const size_t Rpad = gridDim.y * DOTS_BM;
+
+    auto st_a = [&](int st) { return dsm + st * F16_STAGE_BYTES; };
+    auto st_b = [&](int st) { return dsm + st * F16_STAGE_BYTES + F16_A_BYTES; };
+
+    // A: thread t owns the float4 at piece (q * 512 + t) of the 2048 pieces in a stage.
+    // A row is 128 floats = 512 B = 32 pieces, so lanes 0..31 of one q sit on exactly one
+    // row -> one fully coalesced 512 B request per warp instead of the 4-of-every-16 pattern
+    // the int8 kernel uses (which fills half of each 32 B sector: measured 55.8 GB/s on this
+    // part vs 210.2 GB/s for the same bytes read densely, and that was the whole bottleneck
+    // -- the MMA turned out to be free, a NOMMA build ran within 0.4 ms of the real one).
+    //
+    // Consequence: the four pieces a thread holds land on four different rows 16 apart, so
+    // the row sum of squares needs four accumulators and a full-warp reduction (each row's
+    // 128 floats are covered by all 32 lanes) rather than the old 8-lane tree.
+    const int a_row0 = t / 32, a_koff = (t % 32) * 4, a_c = a_koff / 8, a_o = (a_koff % 8) * 2;
+    float av[4][4];
+    float ss[4];
+    #pragma unroll
+    for (int q = 0; q < 4; ++q) ss[q] = 0.0f;
+    auto fetch_a = [&](int k0)
+    {
+        #pragma unroll
+        for (int q = 0; q < 4; ++q)
+        {
+            const int gr = r0 + a_row0 + q * 16;
+            float4 v = make_float4(0, 0, 0, 0);
+            if (gr < R) v = *(const float4*) (s + (size_t) gr * HD + k0 + a_koff);
+            av[q][0] = v.x; av[q][1] = v.y; av[q][2] = v.z; av[q][3] = v.w;
+        }
+    };
+    auto stage_a = [&](int k0, int st)
+    {
+        unsigned char* base = st_a(st);
+        #pragma unroll
+        for (int q = 0; q < 4; ++q)
+        {
+            const half2* wp = (const half2*) (w + k0 + a_koff);
+            const float2 w0 = __half22float2(wp[0]), w1 = __half22float2(wp[1]);
+            ss[q] = __fmaf_rn(av[q][0], av[q][0], ss[q]);
+            ss[q] = __fmaf_rn(av[q][1], av[q][1], ss[q]);
+            ss[q] = __fmaf_rn(av[q][2], av[q][2], ss[q]);
+            ss[q] = __fmaf_rn(av[q][3], av[q][3], ss[q]);
+            half2 h0 = __floats2half2_rn(__fmul_rn(av[q][0], w0.x), __fmul_rn(av[q][1], w0.y));
+            half2 h1 = __floats2half2_rn(__fmul_rn(av[q][2], w1.x), __fmul_rn(av[q][3], w1.y));
+            const int c = f16_swz256(a_row0 + q * 16, a_c) + a_o;
+            // two 4-byte stores, not one 8-byte: a half2 is 4 bytes each, so reinterpreting
+            // the first one as int2 reads past it (that produced NaNs from uninitialised smem)
+            *(int*) (base + c) = *(int*) &h0;
+            *(int*) (base + c + 4) = *(int*) &h1;
+        }
+    };
+    // B: 128 proj rows x 128 k fp16 = 16 pieces per row, 2048 pieces, 4 per thread
+    auto issue_b = [&](int k0, int st)
+    {
+        #pragma unroll
+        for (int q = 0; q < 4; ++q)
+        {
+            const int i = t + q * DOTS_THREADS, row = i / 16, cc = i % 16;
+            const int gn = n0 + row, k = k0 + cc * 8;
+            const int bytes = (gn < Mpad) ? 16 : 0;
+            const size_t off = bytes ? (size_t) gn * HD + k : 0;
+            det_cp_async16(det_smem_u32(st_b(st) + f16_swz256(row, cc)), proj + off, bytes);
+        }
+    };
+
+#if defined(USE_ROCM)
+    // Fallback: ROCm keeps the int8 kernel; this file is CUDA-only.
+    return;
+#else
+    float facc[2][2][4];
+    #pragma unroll
+    for (int i = 0; i < 2; ++i)
+        #pragma unroll
+        for (int j = 0; j < 2; ++j)
+            #pragma unroll
+            for (int q = 0; q < 4; ++q) facc[i][j][q] = 0.0f;
+
+    issue_b(k_beg, 0); det_cp_async_commit();
+    fetch_a(k_beg); stage_a(k_beg, 0);
+    for (int stg = 0; stg < n_stages; ++stg)
+    {
+        const int k0 = k_beg + stg * DOTS_KCH;
+        const bool more = stg + 1 < n_stages;
+        det_cp_async_wait<0>();
+        __syncthreads();
+        if (more) { if (DOTS_STAGES > 1) issue_b(k0 + DOTS_KCH, (stg + 1) & 1); fetch_a(k0 + DOTS_KCH); }
+        det_cp_async_commit();
+        const int st = DOTS_STAGES > 1 ? stg & 1 : 0;
+        const unsigned a_b = det_smem_u32(st_a(st)), b_b = det_smem_u32(st_b(st));
+
+#if defined(F16_NOMMA)
+        // Diagnostic build: keep every load, store and barrier, drop the math. The gap
+        // between this and the real kernel is what the tensor cores actually cost.
+        if (n0 == -1) facc[0][0][0] += __half2float(*((const half*) a_b));
+#else
+        unsigned a[2][4], b[2][2];
+        #pragma unroll
+        for (int ks = 0; ks < DOTS_KCH; ks += 16)
+        {
+            #pragma unroll
+            for (int i = 0; i < 2; ++i) f16_load_a(a[i], a_b, wm * 32 + i * 16, ks / 8, lane);
+            #pragma unroll
+            for (int j = 0; j < 2; ++j) f16_load_b(b[j], b_b, wn * 16 + j * 8, ks / 8, lane);
+            #pragma unroll
+            for (int i = 0; i < 2; ++i)
+                #pragma unroll
+                for (int j = 0; j < 2; ++j) mma_f16(facc[i][j], a[i], b[j]);
+        }
+#endif
+        if (DOTS_STAGES == 1 && more)
+        {
+            __syncthreads();
+            issue_b(k0 + DOTS_KCH, 0);
+            stage_a(k0 + DOTS_KCH, 0);
+        }
+        else if (more) stage_a(k0 + DOTS_KCH, st ^ 1);
+    }
+    det_cp_async_wait<0>();
+    __syncthreads();
+#endif
+    // Epilogue: stage through smem (aliases the ring) to coalesce, then write fp32
+    float (*cs_)[DOTS_BN + 4] = (float (*)[DOTS_BN + 4]) dsm;
+    #pragma unroll
+    for (int i = 0; i < 2; ++i)
+        #pragma unroll
+        for (int j = 0; j < 2; ++j)
+            #pragma unroll
+            for (int q = 0; q < 4; ++q)
+                cs_[wm * 32 + i * 16 + g + (q >= 2 ? 8 : 0)][wn * 16 + j * 8 + tg * 2 + (q & 1)] = facc[i][j][q];
+    __syncthreads();
+    float* out = dm_part + (size_t) slice * Rpad * Mpad;
+    #pragma unroll
+    for (int q = 0; q < (DOTS_BM * DOTS_BN) / DOTS_THREADS; ++q)
+    {
+        const int i = (t + q * DOTS_THREADS) / DOTS_BN, j = (t + q * DOTS_THREADS) % DOTS_BN;
+        if (n0 + j < Mpad) out[(size_t) (r0 + i) * Mpad + n0 + j] = cs_[i][j];
+    }
+    #pragma unroll
+    for (int q = 0; q < 4; ++q)
+    {
+        float a = ss[q];
+        a = __fadd_rn(a, __shfl_xor_sync(0xffffffffu, a, 16));
+        a = __fadd_rn(a, __shfl_xor_sync(0xffffffffu, a, 8));
+        a = __fadd_rn(a, __shfl_xor_sync(0xffffffffu, a, 4));
+        a = __fadd_rn(a, __shfl_xor_sync(0xffffffffu, a, 2));
+        a = __fadd_rn(a, __shfl_xor_sync(0xffffffffu, a, 1));
+        if (lane == 0 && blockIdx.x == 0)
+            ss_part[(size_t) slice * Rpad + r0 + a_row0 + q * 16] = a;
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// host launcher, so the probe can time dots alone against the 13.26 ms int8 reference
+
+int f16_dots_slices(int R, int D, int Mpad)
+{
+    return gr_dots_slices_per_stream(R, D, Mpad) * HC;
+}
+
+void gr_dots_f16_launch
+(
+    const at::Tensor& s,            // (R, HC*D) float
+    const at::Tensor& w,            // (HC*D) half
+    const at::Tensor& proj,         // (Mpad, HC*D) half
+    at::Tensor dm_part,             // (S, Rpad, Mpad) float
+    at::Tensor ss_part,             // (S, Rpad) float
+    int64_t R_, int64_t D_, int64_t Mpad_
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(s.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    const int R = (int) R_, D = (int) D_, Mpad = (int) Mpad_;
+    const int Rpad = (R + DOTS_BM - 1) / DOTS_BM * DOTS_BM;
+    const int q = gr_dots_slices_per_stream(R, D, Mpad), S = HC * q;
+    static bool attr = false;
+    if (!attr) { cudaFuncSetAttribute(gr_dots_f16, cudaFuncAttributeMaxDynamicSharedMemorySize, F16_DOTS_SMEM); attr = true; }
+    dim3 grid((Mpad + DOTS_BN - 1) / DOTS_BN, Rpad / DOTS_BM, S);
+    gr_dots_f16<<<grid, DOTS_THREADS, F16_DOTS_SMEM, stream>>>(
+        (const float*) s.data_ptr(), (const half*) w.data_ptr(), (const half*) proj.data_ptr(),
+        (float*) dm_part.data_ptr(), (float*) ss_part.data_ptr(), R, D, Mpad, D / q);
+    cuda_check(cudaPeekAtLastError());
+}
+
+
+// ---------------------------------------------------------------------------------------------
+// Whole-site entry for the fp16 dots path: identical to gr_mix_tiled except that the projection
+// GEMM reads the resident fp16 tables, so proj_i8 / proj_sb disappear from the call. Everything
+// after the dots stage (latent quantisation, gate GEMM) is the shipped int8 code, unchanged.
+
+void gr_mix_tiled_f16
+(
+    const at::Tensor& streams,           // (R, H, D) float
+    const at::Tensor& w,                 // (H * D) half norm weight (incl +1)
+    const at::Tensor& proj_h,            // (Mpad, H * D) half, rows >= M must be finite
+    const at::Tensor& up_i8,             // (2, H * D, LR) int8
+    const at::Tensor& up_sb,             // (H * D) float
+    double rms_eps,
+    int M,                               // proj rows in use: LR (+ H with post)
+    at::Tensor dm_part,                  // (S, Rpad, Mpad) float workspace
+    at::Tensor ss_part,                  // (S, Rpad) float workspace
+    at::Tensor rmr,                      // (R, H) float workspace
+    at::Tensor t_i8,                     // (2, R, LR) int8 workspace
+    at::Tensor t_s,                      // (R, LR / 64) float workspace
+    c10::optional<at::Tensor> post,      // (R, H) float out, or none (final-mixer form)
+    at::Tensor mixed                     // (R, D) half out
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(streams.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+    TORCH_CHECK_DTYPE(streams, kFloat);
+    TORCH_CHECK_DTYPE(w, kHalf);
+    TORCH_CHECK_DTYPE(proj_h, kHalf);
+    TORCH_CHECK_DTYPE(up_i8, kChar);
+    TORCH_CHECK_DTYPE(up_sb, kFloat);
+    TORCH_CHECK(streams.is_contiguous() && w.is_contiguous() && proj_h.is_contiguous() &&
+                up_i8.is_contiguous() && up_sb.is_contiguous() && dm_part.is_contiguous() &&
+                ss_part.is_contiguous() && rmr.is_contiguous() && t_i8.is_contiguous() &&
+                t_s.is_contiguous() && mixed.is_contiguous(),
+                "gr_mix_tiled_f16: contiguous tensors required");
+    const int R = streams.size(0);
+    const int H = streams.size(1);
+    const int D = streams.size(2);
+    const int HD = H * D;
+    const int Mpad = proj_h.size(0);
+    const int LR = up_i8.size(2);
+    const int Rpad = (R + DOTS_BM - 1) / DOTS_BM * DOTS_BM;
+    const int q = gr_dots_slices_per_stream(R, D, Mpad), S = HC * q;
+    TORCH_CHECK(H == HC, "gr_mix_tiled_f16: H = 4 only");
+    TORCH_CHECK(D % DOTS_KCH == 0 && LR % GATE_KCH == 0, "gr_mix_tiled_f16: D must be a multiple of 128 and LR of 64");
+    TORCH_CHECK(LR > 0, "gr_mix_tiled_f16: LR must be a positive multiple of 64");
+    TORCH_CHECK(proj_h.size(1) == HD && up_i8.size(0) == 2 && up_i8.size(1) == HD && w.numel() == HD, "gr_mix_tiled_f16: dims");
+    TORCH_CHECK(up_sb.numel() == HD, "gr_mix_tiled_f16: scales");
+    TORCH_CHECK(M == LR + (post ? H : 0) && M <= Mpad, "gr_mix_tiled_f16: proj rows must be LR (+ H with post)");
+    TORCH_CHECK(Mpad % 64 == 0 && Mpad <= DOTS_MAXN, "gr_mix_tiled_f16: proj rows must be padded to a multiple of 64, at most 512");
+    TORCH_CHECK(dm_part.size(0) >= S && dm_part.size(1) >= Rpad && dm_part.size(2) == Mpad, "gr_mix_tiled_f16: dm_part workspace");
+    TORCH_CHECK(ss_part.size(0) >= S && ss_part.size(1) >= Rpad, "gr_mix_tiled_f16: ss_part workspace");
+    TORCH_CHECK(rmr.size(0) == R && rmr.size(1) == H, "gr_mix_tiled_f16: rmr workspace");
+    TORCH_CHECK(t_i8.size(0) == 2 && t_i8.size(1) == R && t_i8.size(2) == LR && t_s.size(0) == R && t_s.size(1) == LR / 64, "gr_mix_tiled_f16: latent workspace");
+    TORCH_CHECK(mixed.size(0) == R && mixed.size(1) == D, "gr_mix_tiled_f16: mixed shape");
+    if (post) { TORCH_CHECK_DTYPE(post.value(), kFloat); TORCH_CHECK(post.value().is_contiguous() && post.value().size(0) == R && post.value().size(1) == H, "gr_mix_tiled_f16: post shape"); }
+    if (!R) return;
+
+    const float* s_p = (const float*) streams.data_ptr();
+    const half* w_p = (const half*) w.data_ptr();
+    const signed char* uhi = (const signed char*) up_i8.data_ptr();
+    const signed char* ulo = uhi + (size_t) HD * LR;
+    float* dm_p = (float*) dm_part.data_ptr();
+    float* ss_p = (float*) ss_part.data_ptr();
+    float* rmr_p = (float*) rmr.data_ptr();
+    signed char* thi = (signed char*) t_i8.data_ptr();
+    signed char* tlo = thi + (size_t) R * LR;
+    float* ts_p = (float*) t_s.data_ptr();
+    float* post_p = post ? (float*) post.value().data_ptr() : nullptr;
+    half* mixed_p = (half*) mixed.data_ptr();
+
+    // dots: the dedicated launcher publishes its own cudaFuncSetAttribute and launches on the
+    // same stream, so the three stages stay ordered exactly as in gr_mix_tiled
+    gr_dots_f16_launch(streams.view({R, HD}), w, proj_h, dm_part, ss_part, R, D, Mpad);
+
+    gr_latent_i8<<<R, Mpad, 0, stream>>>(dm_p, ss_p, rmr_p, thi, tlo, ts_p, post_p, R, D, LR, M, Mpad, S, Rpad, (float) rms_eps);
+    cuda_check(cudaPeekAtLastError());
+
+    int dev = 0;
+    cudaGetDevice(&dev);
+    static bool attr[32] = {};
+    if (!attr[dev])
+    {
+        cudaFuncSetAttribute(gr_gate_i8, cudaFuncAttributeMaxDynamicSharedMemorySize, GATE_SMEM);
+        attr[dev] = true;
+    }
+
+    dim3 grid_c(D / GATE_TD, Rpad / GATE_BM);
+    gr_gate_i8<<<grid_c, GATE_THREADS, GATE_SMEM, stream>>>(s_p, rmr_p, w_p, thi, tlo, ts_p, uhi, ulo,
+        (const float*) up_sb.data_ptr(), mixed_p, R, D, LR);
+    cuda_check(cudaPeekAtLastError());
+}
+
+#endif  // !USE_ROCM

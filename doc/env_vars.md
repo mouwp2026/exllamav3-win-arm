@@ -360,11 +360,12 @@ samplers, optionally preceded by repetition/presence/frequency penalties) run as
 kernels working directly in logit space, instead of the step-by-step softmax/sort pipeline.
 Collapsed temperature/min-P stacks sample the same token as the uncollapsed reference for the
 same seed, up to float rounding at exact ties; top-K/top-P stacks keep the same token set as
-the sort-based reference (ties at the exact cutoff are all kept) but draw their Gumbel noise by
-token id rather than sorted position, so individual seeds map to different samples from the
-same distribution. Stacks the collapse does not recognize fall back to the step-by-step path by
-design. Set to `0` to disable collapsing entirely, e.g. for A/B validation against the
-reference implementation.
+the sort-based reference, except for ties at the exact cutoff (top-K keeps all of them, top-P
+keeps all of them at the combined weight of the ties the cumulative sum reaches), but draw
+their Gumbel noise by token id rather than sorted position, so individual seeds map to different
+samples from the same distribution. Stacks the collapse does not recognize fall back to the
+step-by-step path by design. Set to `0` to disable collapsing entirely, e.g. for A/B validation
+against the reference implementation.
 
 ## MTP drafting
 
@@ -636,9 +637,10 @@ recurrent decode kernels (Qwen3.5, Qwen3.8, GLM-5.3) reduce their per-slice part
 products in a fixed order unconditionally (no switch, no cost), so greedy decode on those
 models is reproducible as well.
 
-### `EXL3_MOE_PINNED_ARENA` (default: `0`, experimental)
+### `EXL3_MOE_PINNED_ARENA` (default: `0`)
 
-Back the CPU worker's expert-weight arena with shared chunks that the parent process also maps
+Default for `Config.infer_params.moe_cpu_pinned_arena` (`-mcpa` / `--moe_cpu_pinned_arena` in
+`model_init`). Back the CPU worker's expert-weight arena with shared chunks that the parent process also maps
 and page-locks (`cudaHostRegister`), and lay each expert's gate/up/down trellis tensors out as
 one contiguous block. Streamed prefill (`EXL3_MOE_STREAM_T`) then DMAs an expert's block
 straight out of the arena on the copy stream instead of having the worker's stager thread
@@ -655,7 +657,39 @@ preallocated with `fallocate` and then page-locked by the parent, so neither the
 nor the later collapse pass can convert them (on the default `never` the CPU kernels run on 4K
 pages, which cost a few percent of decode on some hosts). On Windows the chunks are named
 pagefile-backed sections (4K pages); each must fit both free physical RAM and commit headroom
-when it is created, or the load fails naming the chunk.
+when it is created, or the load fails naming the chunk. Page-locked memory is budgeted by the
+driver on some platforms (WDDM and WSL2 allow about half of RAM per process, shared with the
+pinned KV tiers): when registering a chunk fails for lack of it, the chunks already registered
+keep the DMA path and the experts in the rest of the arena stream through the staged path, with
+one notice at load.
+
+### `EXL3_MOE_CPU_PROMOTE` (default: `4`)
+
+Spare GPU expert slots per layer for promote-on-miss in `--moe_cpu_split` mode with the pinned
+arena (`EXL3_MOE_PINNED_ARENA=1`); `0` keeps the periodic swap sweep instead. Each decode step, a
+routed expert the CPU worker had to compute is copied from the arena into a free spare slot on a
+side stream, and once the copy has landed the placement map sends later routes to the GPU; the
+least-used resident that was not routed goes the other way into the worker slot the promotion
+freed, so the resident set follows the conversation token by token instead of once per sweep, and
+no transfer reads the checkpoint or stops the worker. Needs the pinned arena because the parent
+process DMAs the expert bytes straight between the GPU slots and the worker's memory. Up to six
+promotions per step over all layers (one per layer), and as many demotions; the spares' own experts
+start in the worker. `EXL3_MOE_CPU_SWAP_DEBUG=1` prints the transfer counts, the hit rate and the
+step's bookkeeping cost every 128 steps.
+
+Both dynamic modes save each layer's decayed expert selection counts to
+`~/.cache/exllamav3/expert_stats/<hash>.json` (`$XDG_CACHE_HOME` if set; the hash covers the model
+directory and the expert count) every 4096 decode steps and on unload, and the next load of the same
+model permutes the experts hottest first from that profile, so the GPU slice starts with the frequent
+experts instead of the checkpoint's arbitrary head. A profile from a different workload only costs
+what the default placement costs anyway, and the map adapts from there. `EXL3_MOE_CPU_SPLIT_STATS`
+(an explicit stats file in the same per-layer format) takes precedence.
+
+### `EXL3_MOE_CPU_PROMOTE_VERIFY` (default: unset)
+
+Debug: after every landed transfer, read the expert back and compare it with the checkpoint (a
+promotion's GPU slot tensors; a demotion's packed arena bytes and aux copies). Synchronizes and
+reads the checkpoint per transfer, so it is for short runs.
 
 ### `EXL3_HOST_MEM_RESERVE_MB` (default: `2048`)
 
@@ -735,19 +769,16 @@ fp16 input of the down projection, as in the per-expert path). `EXL3_MOE_BATCH_R
 covers GPU-resident experts, `EXL3_MOE_STREAM_BATCH_RECON` the streamed CPU experts (the
 `EXL3_MOE_STREAM_FUSED_T` overflow tier). Set to `0` to restore the per-expert loops.
 
-### `EXL3_MOE_RECON_TILES` (default: `64`), `EXL3_MOE_RECON_BATCH` (default: `16`), `EXL3_MOE_RECON_PAD` (default: `1.1`), `EXL3_MOE_RECON_ROWS` (default: `16384`), `EXL3_MOE_RECON_MB` (default: `256`), `EXL3_MOE_RECON_MAX_ROWS` (default: unset), `EXL3_MOE_RECON_FOLDED` (default: `1`)
+### `EXL3_MOE_RECON_TILES` (default: `0`), `EXL3_MOE_RECON_BATCH` (default: `16`), `EXL3_MOE_RECON_PAD` (default: `1.1`), `EXL3_MOE_RECON_ROWS` (default: `16384`), `EXL3_MOE_RECON_MB` (default: `256`), `EXL3_MOE_RECON_MAX_ROWS` (default: unset), `EXL3_MOE_RECON_FOLDED` (default: `1`)
 
-Tuning for the batched reconstruct tier. Batching pays while a single expert's GEMM cannot
-fill the GPU: an `m x n` GEMM launches about `m/128 * n/128` output tiles, and below roughly
-the SM count the strided-batched kernel is much faster (PRO 6000, `k = 2048`: `n = 768` runs
-1.45x faster batched at `m = 1024` and 2.9x at `m = 256`, `n = 1792` breaks even at
-`m = 1024`), while above it the batched cuBLAS kernels are 10-15% slower than the single-GEMM
-ones, and the padded slabs cost traffic that grows with the rows. `EXL3_MOE_RECON_TILES` is
-that tile budget: an expert stays on the per-expert path once its narrowest projection
-(`min(intermediate, hidden)`) would span more tiles, i.e. above `TILES * 16384 / n_min` rows
-(1365 rows for `n = 768`, 512 for `n = 2048`). Measured at 8k tokens on a PRO 6000: lfm2.5
-(`n` 1792/2048) loses 15% with everything batched and 4% at a 1024-row cap, parity at 512;
-Qwen3.8-Flash-Next (`n = 768`) is within 2% for any cap. `0` batches
+Tuning for the batched reconstruct tier. By default every expert above the fused kernel's row
+capacity joins the tier, up to the padded-row budget per group (`EXL3_MOE_RECON_ROWS`): the
+tier's one reconstruct and one library GEMM per projection over a slab beat the per-expert path
+(a reconstruct, three GEMMs and a gather and scatter per expert) at every row count, including
+the experts a large chunk piles thousands of rows onto, on both the full-rate and the half-rate
+fp32-accumulate GPUs. `EXL3_MOE_RECON_TILES` restores the earlier limit, a budget of output tiles
+(`m/128 * n/128`) above which an expert's GEMM was assumed to fill the GPU on its own and the
+expert stayed on the per-expert path; `0` batches
 every expert; `EXL3_MOE_RECON_MAX_ROWS` overrides the derived row cap directly. The other
 knobs: experts per group; `EXL3_MOE_RECON_PAD`, the padded-to-real row ratio a group may reach
 before the planner starts a new one (groups fill largest expert first, so this splits only
@@ -784,6 +815,21 @@ else lands on its cores, so pinning is the default on every platform. `0` lets t
 float, which can be worth testing on a host that also runs other work; the reserved host core
 (`EXL3_MOE_HOST_CORES`) stays in effect either way. Falls back to no pinning if the CPU
 topology can't be read.
+
+### `EXL3_MOE_CPU_SPREAD` (default: `0`)
+
+Linux only. Set to `1` to order physical worker cores round-robin across L3 cache domains
+before assigning SMT siblings. With fewer workers than physical cores, this avoids placing
+the whole pool on the first one or two CCDs. It works with `-mct` / `EXL3_MOE_CPU_THREADS`
+and the existing worker pinning; the reserved host cores follow the same ordering. The
+default retains CPU-ID order. Unreadable L3 topology falls back to that default order.
+
+On a 24-core Threadripper 7960X, LFM2.5-8B split decode (`-mcs 16 -mcpa`) measured about
+240 tok/s with `EXL3_MOE_CPU_SPREAD=1 -mct 12`, versus 222–225 tok/s with the default 23
+workers and 232 tok/s with 12 workers in the default order. Full offload was approximately
+unchanged with the spread 12-worker pool. These are workload-specific measurements, not an
+automatic thread-count recommendation. This changes CPU affinity only, not NUMA memory
+placement; benchmark it with the actual model and allocation policy on multi-socket hosts.
 
 ### `EXL3_MOE_HOST_CORES` (default: `1`)
 
@@ -957,6 +1003,14 @@ traffic; for A/B testing of the wire rounding.
 Print a line (once per process) when the fp16 all-reduce wire first activates. Activation check
 for numerics A/B tests: whether the wire engages depends on the model's residual dtype, so a
 comparison is only meaningful if the fp16-wire run actually used it.
+
+### `EXL3_TP_REDUCE_MAX_ISA` (default: unset, auto-detect)
+
+`avx`, `avx2` or `avx512`: cap the CPU all-reduce of the native tensor-parallel backend at a
+lower instruction-set tier than the CPU supports, for exercising the lower tiers on a newer
+machine. The tiers compute the same sums (the AVX tier does its 16-bit moves on 128-bit lanes and
+its adds on 256-bit floats; the fp16 wire needs F16C on every tier). Plain AVX is the floor: a CPU
+without it must use the NCCL backend.
 
 ### `EXL3_TP_REDUCE_THREADS` (default: number of participating ranks)
 

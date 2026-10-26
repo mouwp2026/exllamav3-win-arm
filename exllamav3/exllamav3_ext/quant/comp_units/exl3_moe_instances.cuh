@@ -41,6 +41,26 @@ EXL3_MOE_DECLARE_MTILE_GETTERS(8);
 
 #undef EXL3_MOE_DECLARE_MTILE_GETTERS
 
+// M2e: 112-row tile instances (mul1 codebook, N = 128). Sized so a 640-row expert
+// (32768-token chunk over 512 experts) runs as six M passes instead of forty 16-row
+// passes, while the M = 112 / K = 32 / N = 128 / 3-stage footprint stays at 83456 B,
+// under the 90 KB launch request. Prefill-only: the Python side opts in via
+// EXL3_MOE_MTILE_WIDE
+#define EXL3_MOE_DECLARE_MTILE_WIDE_GETTERS(K) \
+    fp_exl3_moe_kernel exl3_moe_kernel_k##K##_n128_cb2_m112(); 
+
+EXL3_MOE_DECLARE_MTILE_WIDE_GETTERS(0);
+EXL3_MOE_DECLARE_MTILE_WIDE_GETTERS(1);
+EXL3_MOE_DECLARE_MTILE_WIDE_GETTERS(2);
+EXL3_MOE_DECLARE_MTILE_WIDE_GETTERS(3);
+EXL3_MOE_DECLARE_MTILE_WIDE_GETTERS(4);
+EXL3_MOE_DECLARE_MTILE_WIDE_GETTERS(5);
+EXL3_MOE_DECLARE_MTILE_WIDE_GETTERS(6);
+EXL3_MOE_DECLARE_MTILE_WIDE_GETTERS(7);
+EXL3_MOE_DECLARE_MTILE_WIDE_GETTERS(8);
+
+#undef EXL3_MOE_DECLARE_MTILE_WIDE_GETTERS
+
 // Half-integer rates K + 0.5 (exl3_moe_inst_h{K}_*.cu), mul1 codebook only
 #define EXL3_MOE_DECLARE_HALF_GETTERS(K) \
     fp_exl3_moe_kernel exl3_moe_kernel_h##K##_n128_cb2(); \
@@ -57,6 +77,7 @@ EXL3_MOE_DECLARE_HALF_GETTERS(3);
 extern fp_exl3_moe_kernel exl3_moe_kernel_instances[];
 extern fp_exl3_moe_kernel exl3_moe_kernel_instances_m32[];   // [K], N = 128
 extern fp_exl3_moe_kernel exl3_moe_kernel_instances_m64[];   // [K], N = 128
+extern fp_exl3_moe_kernel exl3_moe_kernel_instances_m112[]; // [K], N = 128, M2e
 extern fp_exl3_moe_kernel exl3_moe_kernel_instances_h[];     // [K - 1][N_off], rate K + 0.5
 extern fp_exl3_moe_kernel exl3_moe_kernel_instances_h_m32[]; // [K - 1], N = 128
 extern fp_exl3_moe_kernel exl3_moe_kernel_instances_h_m64[]; // [K - 1], N = 128

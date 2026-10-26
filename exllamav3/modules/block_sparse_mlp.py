@@ -8,6 +8,7 @@ from ..util.device_copy import host_to_device
 from ..util.tensor import to2
 from . import Module, Linear
 from .multilinear import MultiLinear
+import time as _m2time
 from collections import defaultdict as _defaultdict
 from ..ext import exllamav3_ext as ext
 from ..util.backend import MOE_FUSED_ROWS, MOE_BATCH_RECON, MOE_MTILE
@@ -39,12 +40,84 @@ BATCH_RECON = MOE_BATCH_RECON
 # launch
 MTILE = MOE_MTILE
 MTILE_T1, MTILE_T2 = 16, 32
+# M2e: opt-in 112-row tile tier for prefill-sized experts (EXL3_MOE_MTILE_WIDE=112).
+# 0 keeps the shipped 16/32/64 behaviour
+MTILE_WIDE = int(os.environ.get("EXL3_MOE_MTILE_WIDE", "0"))
+# [M2e S1c] runtime switch for the hoisted support_fused block (fork bug fix).
+# 0 = shipped behaviour: the block sits inside the mixed-K branch and never runs
+# 1 = hoisted out, fused MoE tier reachable on uniform-K models
+_S1B_FUSED_HOIST = os.environ.get("EXL3_MOE_FUSED_HOIST", "1") != "0"
 # Fused-kernel row capacity per expert when the wide tiles apply: with them the fused kernel
 # beats the batched reconstruct tier up to 256 rows (Qwen3.8 4k chunk: 128 -> 256 rows +3%)
+# ===== M2 host-side profiler (EXL3_MOE_PROF=1, default off) ==================
+_M2_PROF_ON = os.environ.get("EXL3_MOE_PROF", "0") != "0"
+_M2_DIAG = [os.environ.get("EXL3_MOE_DIAG", "0") != "0"]
+_M2_DIAG_MORE = [os.environ.get("EXL3_MOE_DIAG", "0") != "0"]
+_M2_DIAG3 = [os.environ.get("EXL3_MOE_DIAG", "0") != "0"]
+_M2_ONCE = [True]
+_M2_PROF = {"fwd_n": 0, "total_ms": 0.0, "tolist_ms": 0.0, "tolist_n": 0,
+            "plan_ms": 0.0, "plan_n": 0, "groups_n": 0, "recon_ms": 0.0,
+            "recon_n": 0, "rows": 0, "used_sum": 0, "ec_n": 0}
+
+
+def _m2_dump():
+    p = _M2_PROF
+    n = max(p["fwd_n"], 1)
+    print(
+        f"[M2PROF] fwd={p['fwd_n']} total={p['total_ms']/1e3:.2f}s "
+        f"({p['total_ms']/n:.1f}ms/call) | tolist={p['tolist_ms']/1e3:.2f}s/"
+        f"{p['tolist_n']} ({p['tolist_ms']/max(p['tolist_n'],1):.1f}ms) | "
+        f"plan={p['plan_ms']/1e3:.2f}s/{p['plan_n']} (groups/call="
+        f"{p['groups_n']/max(p['plan_n'],1):.1f}) | recon={p['recon_ms']/1e3:.2f}s/"
+        f"{p['recon_n']} ({p['recon_ms']/max(p['recon_n'],1):.1f}ms) | rows={p['rows']} | "
+        f"ECON used_avg={p['used_sum']/max(p['ec_n'],1):.1f} n={p['ec_n']} sum={p['used_sum']:.0f} "
+        f"min={p.get('used_min')} max={p.get('used_max')} "
+        f"cnt[min={p.get('cnt_min')} max={p.get('cnt_max')}]",
+        flush=True)
+
+
+def _m2_tolist(t):
+    t0 = _m2time.perf_counter()
+    r = t.tolist()
+    _M2_PROF["tolist_ms"] += (_m2time.perf_counter() - t0) * 1e3
+    _M2_PROF["tolist_n"] += 1
+    return r
+
+# ===========================================================================
+
 FUSED_ROWS_WIDE = int(os.environ.get("EXL3_MOE_FUSED_ROWS_WIDE", 256))
 # Deterministic (slot + gather) accumulation for the fused kernel's outputs; EXL3_MOE_FUSED_DET=0
 # restores the atomic adds
 FUSED_DET = os.environ.get("EXL3_MOE_FUSED_DET", "1") != "0"
+# --------------------------------------------------------------------------- #
+# EXL3_MOE_TRACE=1: per-forward MoE tier accounting (off by default, zero cost).
+# One line per MoE forward: token count, rows served by the mixedk fused tier,
+# batch_recon group count and size, and the per-expert row min/median/max. Tells
+# you which dequantization path a prefill actually takes.
+# --------------------------------------------------------------------------- #
+_MOE_TRACE = os.environ.get("EXL3_MOE_TRACE", "0") != "0"
+_moe_trace_n = [0]
+
+
+def _moe_trace(ntok, topk, fused_rows, groups, ecl, num_ex, mod):
+    _moe_trace_n[0] += 1
+    mkd_rows = getattr(mod, "_mkd_fused_rows", None)
+    base = (f"[MOE_TRACE] call={_moe_trace_n[0]} ntok={ntok} topk={topk} "
+            f"fused_rows={fused_rows} mkd_rows={mkd_rows} "
+            f"mtile_ok={getattr(mod, '_mkd_mtile_ok', None)}")
+    if ecl is None:
+        print(base + " groups=None (no count readback)", flush=True)
+        return
+    cs = sorted(ecl[:num_ex])
+    gmax = max((max(ecl[e] for e in g) for g in groups), default=0)
+    gsum = sum(sum(ecl[e] for e in g) for g in groups)
+    print(base + f" ngroups={len(groups)} gsum={gsum} gmax={gmax} "
+                 f"rows[min/med/max]={cs[0]}/{cs[len(cs) // 2]}/{cs[-1]} "
+                 f"n_over_mkd={sum(1 for c in cs if c > (mkd_rows or 0))} "
+                 f"recon_max_rows={getattr(mod, '_recon_max_rows', None)} "
+                 f"recon_cap={getattr(mod, '_recon_cap', None)}", flush=True)
+
+
 # Minimum routed row count (tokens * experts-per-token) for the unified mixed-K kernel, layered on
 # top of EXL3_MIXEDK_LEGACY. That switch picks one path for the whole run; this lets decode fall to
 # the legacy per-K-group coop dispatch while prefill keeps the unified kernel. The unified kernel
@@ -148,8 +221,8 @@ _moe_shared_coop = os.environ.get("EXL3_MOE_SHARED_COOP", "1") != "0"
 # fixed-order top-k with FMA-only activations), so under tensor parallelism every rank can route
 # for itself on the (rank-identical) residual stream instead of receiving the selection by
 # broadcast from the output rank: two collectives per MoE layer per token fewer. Every router in
-# use is on those paths; the grouped DS3 router (n_group > 1, not supported by any loadable
-# architecture) is still torch-composed and would keep the broadcast
+# use is on those paths except the grouped DS3 router (n_group > 1, Ling 3.x), which is still
+# torch-composed (fp32 logits) and keeps the broadcast
 _replicated_router_types = ("std", "std_bias", "dots", "sqrtsp", "sqrtsp_hash")
 _routing_check_stats = {}
 
@@ -718,18 +791,25 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 # keep mixedk_k_groups populated so the legacy path can be selected at runtime
                 print(f" -- Mixed-K UNIFIED kernel enabled in {self.key}: {_ne} experts, K_up range [{_ku.min().item()},{_ku.max().item()}]")
 
-            # Enable fully fused kernel if possible (uniform mcg or mul1 codebook across gate/up/down,
-            # and an activation the fused kernel implements)
-            if self.multi_up is not None:
-                cbs = (
-                    self.multi_gate.q_cb() if self.gated else self.multi_up.q_cb(),
-                    self.multi_up.q_cb(),
-                    self.multi_down.q_cb(),
-                )
-                self.support_fused = (
-                    cbs[0] == cbs[1] == cbs[2] and cbs[0] in ((True, False), (False, True)) and
-                    self.support_quant_paths
-                )
+        # [M2e S1b] hoisted out of the mixed-K branch (fork bug: dead on uniform-K)
+        # Qwen3.8-Flash-Next has one K for all experts, so the branch below never ran
+        # Enable fully fused kernel if possible (uniform mcg or mul1 codebook across gate/up/down,
+        # and an activation the fused kernel implements)
+        if self.multi_up is not None and _S1B_FUSED_HOIST:
+            cbs = (
+                self.multi_gate.q_cb() if self.gated else self.multi_up.q_cb(),
+                self.multi_up.q_cb(),
+                self.multi_down.q_cb(),
+            )
+            self.support_fused = (
+                cbs[0] == cbs[1] == cbs[2] and cbs[0] in ((True, False), (False, True)) and
+                self.support_quant_paths
+            )
+            if os.environ.get("EXL3_MOE_DIAG", "0") != "0":
+                print(f"[M2DIAG4] cbs={cbs} uniform={cbs[0] == cbs[1] == cbs[2]} "
+                      f"in_set={cbs[0] in ((True, False), (False, True))} "
+                      f"sqp={self.support_quant_paths} -> support_fused={self.support_fused}",
+                      flush=True)
 
         # Temp buffers for graph, dq and fused-bsz1 paths
         numex = self.num_experts_per_tok
@@ -1070,6 +1150,13 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 self.device,
                 no_defer = True,
             )
+            # The table's values become expert indices in the routing kernels (issue #526): a
+            # checkpoint value outside the expert range must fail here, not in the kernel
+            if self.tid2eid.numel():
+                lo, hi = int(self.tid2eid.min()), int(self.tid2eid.max())
+                if lo < 0 or hi >= self.num_experts:
+                    raise ValueError(f"{self.key}.{self.tid2eid_key}: expert ids span [{lo}, {hi}], "
+                                     f"outside the {self.num_experts} routed experts")
         if self.per_expert_scale_key:
             self.per_expert_scale = self.config.stc.get_tensor(
                 f"{self.key}.{self.per_expert_scale_key}",
@@ -1275,6 +1362,21 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         else:
             y = x.view(-1, self.hidden_size)
         bsz = y.shape[0]
+        if _M2_DIAG3[0] and bsz >= 4096:
+            _M2_DIAG3[0] = False
+            _cbs = (self.multi_gate.q_cb() if (self.gated and self.multi_gate is not None) else None,
+                    self.multi_up.q_cb() if self.multi_up is not None else None,
+                    self.multi_down.q_cb() if self.multi_down is not None else None)
+            _bias = any(l.inner.bias is not None for l in (self.gates + self.ups + self.downs))
+            _trim = any(l.trim_padded_out and l.out_features != l.out_features_unpadded
+                        for l in self.downs)
+            print(f"[M2DIAG3] bsz={bsz} is_q={self.is_quantized} uni_q={self.uniform_expert_q} "
+                  f"act={self.activation_fn} gated={self.gated} sqp={self.support_quant_paths} "
+                  f"sfused={self.support_fused} has_buf={getattr(self, 'fused_mode_buffers', 'unset') is not None} "
+                  f"cbs={_cbs} bias={_bias} trim={_trim} n_multi=[{self.multi_gate is not None},"
+                  f"{self.multi_up is not None},{self.multi_down is not None}] "
+                  f"no_recon={self.config.infer_params.no_reconstruct} "
+                  f"mtile={getattr(self, 'mtile_ok', None)} frows={getattr(self, 'fused_rows', None)}", flush=True)
         bc_sh_exp = False
         if params.get("autosplit_measure"):
             self._measure_rows = bsz
@@ -1454,7 +1556,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 elif mixedk_unified_ok and num_tokens * top_k <= getattr(self, "_mkd_fused_rows", TEMP_ROWS_FUSED):
                     expert_count_list = None
                 else:
-                    expert_count_list = expert_count.tolist()
+                    expert_count_list = (_m2_tolist(expert_count) if _M2_PROF_ON else expert_count.tolist())
 
                 # Tier plan: fused kernel for experts up to self.fused_rows rows, batched
                 # reconstruct groups above that up to the tile cap, per-expert reconstruct beyond
@@ -1477,8 +1579,37 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                         lim = max(min_rows, TEMP_ROWS_GRAPH)
                         heavy = [e for e in range(num_ex) if lim < expert_count_list[e] <= recon.max_rows]
                         if heavy:
+                            self._recon_max_rows = recon.max_rows
+                            self._recon_cap = recon.cap
                             from .moe_batch_recon import plan_groups
+                            _m2t = _m2time.perf_counter()
                             groups = plan_groups(heavy, lambda e: expert_count_list[e], recon.cap)
+                            _M2_PROF["plan_ms"] += (_m2time.perf_counter() - _m2t) * 1e3
+                            _M2_PROF["plan_n"] += 1
+                            _M2_PROF["groups_n"] += len(groups)
+                            if _M2_PROF_ON and num_tokens >= 4096:
+                                _ec = sorted(c for c in expert_count_list[:num_ex] if c > 0)
+                                _M2_PROF["used_sum"] += len(_ec)
+                                _M2_PROF["used_min"] = min(_M2_PROF.get("used_min", 10 ** 9), len(_ec))
+                                _M2_PROF["used_max"] = max(_M2_PROF.get("used_max", 0), len(_ec))
+                                _M2_PROF["cnt_min"] = min(_M2_PROF.get("cnt_min", 10 ** 9), _ec[0])
+                                _M2_PROF["cnt_max"] = max(_M2_PROF.get("cnt_max", 0), _ec[-1])
+                                _M2_PROF["ec_n"] = _M2_PROF.get("ec_n", 0) + 1
+                            if _MOE_TRACE:
+                                _moe_trace(num_tokens, top_k, fused_total, groups, expert_count_list, num_ex, self)
+
+                # [M2e S1d] tier composition: where did the routed rows go?
+                if os.environ.get("EXL3_MOE_TIER", "0") != "0" and num_tokens >= 4096:
+                    _lim = self.fused_rows if self.fused_mode_buffers is not None else 0
+                    _fx = [c for c in expert_count_list[:num_ex] if 0 < c <= _lim] if _lim else []
+                    _hv = [expert_count_list[e] for grp in groups for e in grp]
+                    _rest = num_tokens * top_k - sum(_fx) - sum(_hv)
+                    print(f"[TIER] tok={num_tokens} frows={self.fused_rows} "
+                          f"buf={'Y' if self.fused_mode_buffers is not None else 'N'} "
+                          f"recon={'Y' if recon is not None else 'N'} "
+                          f"| fused: n={len(_fx)} rows={sum(_fx)} max={max(_fx) if _fx else 0} "
+                          f"| grouped: ngrp={len(groups)} rows={sum(_hv)} "
+                          f"| rest: rows={_rest}", flush=True)
 
                 # Deterministic accumulation (FUSED_DET): every assignment of the fused and
                 # batched tiers gets a slot in one fp32 scratch (fused experts: count rows each,
@@ -1572,13 +1703,33 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                         run_fused(-1)
                     else:
                         counts = [c for c in expert_count_list[:num_ex] if 0 < c <= self.fused_rows]
+                        if _M2_DIAG[0]:
+                            _M2_DIAG[0] = False
+                            print(f"[M2DIAG] tokens={num_tokens} top_k={top_k} support_fused={self.support_fused} "
+                                  f"mtile_ok={self.mtile_ok} fused_rows={self.fused_rows} MTILE={MTILE} "
+                                  f"MTILE_WIDE={MTILE_WIDE} has_buf={self.fused_mode_buffers is not None} "
+                                  f"n_fused_e={len(counts)} cnt[min={min(counts) if counts else 0} "
+                                  f"max={max(counts) if counts else 0}] groups={len(groups)} "
+                                  f"recon_cap={getattr(self, '_recon_max_rows', None)}", flush=True)
+                        _w3 = MTILE_WIDE if self.mtile_ok else 0
                         t1 = sum(1 for c in counts if MTILE_T1 < c <= MTILE_T2)
-                        t2 = sum(1 for c in counts if c > MTILE_T2)
-                        if self.mtile_ok and (t1 or t2):
+                        if _w3:
+                            t2 = sum(1 for c in counts if MTILE_T2 < c <= _w3)
+                            t3 = sum(1 for c in counts if c > _w3)
+                        else:
+                            t2 = sum(1 for c in counts if c > MTILE_T2)
+                            t3 = 0
+                        if _M2_DIAG_MORE[0]:
+                            _M2_DIAG_MORE[0] = False
+                            print(f"[M2DIAG2] wide={_w3} t1={t1} t2={t2} t3={t3} "
+                                  f"t0={len(counts) - t1 - t2 - t3} launch={self.mtile_ok and bool(t1 or t2 or t3)}", flush=True)
+                        if self.mtile_ok and (t1 or t2 or t3):
                             # One launch per row tile over its expert range, largest first
-                            t0 = len(counts) - t1 - t2
+                            t0 = len(counts) - t1 - t2 - t3
+                            if t3:
+                                run_fused(t3, _w3 + 1, self.fused_rows, _w3)
                             if t2:
-                                run_fused(t2, MTILE_T2 + 1, self.fused_rows, 64)
+                                run_fused(t2, MTILE_T2 + 1, _w3 if _w3 else self.fused_rows, 64)
                             if t1:
                                 run_fused(t1, MTILE_T1 + 1, MTILE_T2, 32)
                             if t0:
@@ -2212,3 +2363,33 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 owner_keys.append(exported["shared_experts"]["kwargs"]["key"])
             module.tp_owner = module.tp_single_owner(local_context, *owner_keys)
         return module
+# ===== M2 host-side profiler: class-level timing wrappers (no-op when off) ===
+if _M2_PROF_ON:
+    _m2_orig_forward_rows = BlockSparseMLP._forward_rows
+    _m2_orig_run_batch_recon = BlockSparseMLP._run_batch_recon
+
+    def _m2_forward_rows(self, x, params, out_dtype = None):
+        _t = _m2time.perf_counter()
+        try:
+            return _m2_orig_forward_rows(self, x, params, out_dtype)
+        finally:
+            _M2_PROF["total_ms"] += (_m2time.perf_counter() - _t) * 1e3
+            _M2_PROF["fwd_n"] += 1
+            try:
+                _M2_PROF["rows"] = x.numel() // x.shape[-1]
+            except Exception:
+                pass
+            if _M2_PROF["fwd_n"] % 48 == 0:
+                _m2_dump()
+
+    def _m2_run_batch_recon(self, *a, **kw):
+        _t = _m2time.perf_counter()
+        try:
+            return _m2_orig_run_batch_recon(self, *a, **kw)
+        finally:
+            _M2_PROF["recon_ms"] += (_m2time.perf_counter() - _t) * 1e3
+            _M2_PROF["recon_n"] += 1
+
+    BlockSparseMLP._forward_rows = _m2_forward_rows
+    BlockSparseMLP._run_batch_recon = _m2_run_batch_recon
+    print("[M2PROF] host-side profiler installed (EXL3_MOE_PROF=1)", flush=True)

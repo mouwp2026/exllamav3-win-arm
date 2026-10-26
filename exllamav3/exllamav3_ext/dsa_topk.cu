@@ -295,10 +295,12 @@ compaction resolves ties in ascending global index order, identical to the legac
 static at::Tensor& dsa_topk_ws(int device)
 {
     static std::mutex mtx;
-    static std::map<int, at::Tensor> ws;
+    // Leaked: a static map would free its tensors from a static destructor at exit, after the CUDA
+    // allocator has gone (a cudaMallocAsync free at teardown terminates the process)
+    static auto* ws = new std::map<int, at::Tensor>();
     std::lock_guard<std::mutex> lock(mtx);
-    auto it = ws.find(device);
-    if (it == ws.end())
+    auto it = ws->find(device);
+    if (it == ws->end())
     {
         // Candidate indices + counts (int32) followed by candidate scores (half, same count
         // as indices; int-sized allocation keeps one flat buffer)
@@ -307,9 +309,22 @@ static at::Tensor& dsa_topk_ws(int device)
             {(int64_t) TOPK_SPLIT_MAX_R * TOPK_SPLIT_G * TOPK_SPLIT_MAX_KPAD * 3 / 2 + TOPK_SPLIT_MAX_R * TOPK_SPLIT_G},
             at::TensorOptions().dtype(at::kInt).device(at::Device(at::kCUDA, device))
         );
-        it = ws.emplace(device, std::move(t)).first;
+        it = ws->emplace(device, std::move(t)).first;
     }
     return it->second;
+}
+
+// Allocate the split workspace ahead of a graph capture over `scores_static` (the full-width score
+// static a captured top-k scans). The eager pass that precedes a capture may scan only the live
+// prefix of that static, below TOPK_SPLIT_MIN_T, and so never take the split path itself; without
+// this the replay-side split kernel would allocate its workspace under capture (cudaMalloc is not
+// permitted while a stream is capturing)
+void dsa_topk_prepare(const at::Tensor& scores_static, int k_pad)
+{
+    static const bool allow_split = [](){ const char* e = getenv("EXL3_DSA_TOPK_SPLIT"); return !(e && *e == '0'); }();
+    if (!allow_split || scores_static.dim() != 2) return;
+    if (scores_static.size(1) < TOPK_SPLIT_MIN_T || k_pad > TOPK_SPLIT_MAX_KPAD) return;
+    (void) dsa_topk_ws(scores_static.device().index());
 }
 
 template <bool VEC>

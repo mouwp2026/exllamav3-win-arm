@@ -14,6 +14,16 @@ from ..cache.recurrent_util import prepare_for_recurrence
 from .dflash import DFlashConfig, dflash_update_kv_from_target
 from ..util.tensor import get_for_device
 from ..util.device_copy import to_device
+from ..ext import exllamav3_ext as ext
+import os as _os
+
+# Draft-only pruned head (EXL3_DFLASH_HEAD_N): the drafter samples its block logits from a
+# prefix column slice of the shared lm_head instead of the full vocabulary. BPE merge order makes
+# a prefix a frequency-ordered hot set, so no id remapping is needed, and verification keeps
+# using the target's full head, so outputs are unchanged. Mirrors EXL3_MTP_HEAD_N on the MTP
+# drafter (qwen4_exp_mtp.py); confidence falls for out-of-slice argmax, so dynamic drafting
+# stops earlier instead of proposing tokens the slice cannot see.
+_DFLASH_HEAD_N = int(_os.environ.get("EXL3_DFLASH_HEAD_N", "0"))
 
 # DFlash2 draft model: the DFlash encoder (fc + hidden_norm over the concatenated target taps)
 # and SWA/GQA layers, with grouped dynamic convolutions around every attention/MLP sublayer and
@@ -239,10 +249,6 @@ class DFlash2Model(Model):
 
 
     def attach_to(self, target):
-        if target.loaded_tp:
-            raise NotImplementedError(
-                "DFlash2 does not support tensor-parallel targets because the selector needs top-k logits"
-            )
         if target.config.vocab_size != self.config.vocab_size:
             raise ValueError(
                 f"DFlash2 vocabulary size {self.config.vocab_size} does not match "
@@ -285,14 +291,42 @@ class DFlash2Model(Model):
         anchor. The selector is greedy; sampling remains lossless because the
         target verifier still samples normally and accepts only exact matches."""
         target = self.attached_model()
-        lm = target.modules[target.logit_layer_idx]
-        logits = lm.prepare_for_device(state.half(), params)
-        logits = lm.forward(logits, params)
-
         dev = self.selector.device
         # The generator stages the block ids in pinned memory: upload without a host sync
         anchor = get_for_device(params, "dflash2_anchor_ids", dev)[:, -1]
         export_conf = params.get("export_draft_conf", False)
+        if target.loaded_tp:
+            # Tensor-parallel target: each rank takes the selector's top-k over its vocabulary slice of
+            # the head and the candidates are merged on the output device, so only k ids and scores per
+            # row cross the ranks, never the logits. The drafter stays on one device
+            staged = target.tp_producer.send(state[:, 1:].half())
+            unary, cands = target.tp_dispatch_lm_head_topk(
+                (staged, {}), self.selector.top_k,
+                scale = self.config.output_multiplier, softcap = self.config.final_logit_softcapping or 0.0,
+            )
+            out, confidence = self.selector.walk_candidates(
+                to_device(state[:, 1:], dev), to_device(unary, dev), to_device(cands, dev), anchor,
+                return_confidence = export_conf,
+            )
+            if export_conf:
+                params["draft_conf"] = confidence
+            return out
+
+        lm = target.modules[target.logit_layer_idx]
+        logits = lm.prepare_for_device(state.half(), params)
+        vocab_size = target.config.vocab_size
+        ph = self._pruned_head(lm, logits.device) if _DFLASH_HEAD_N > 0 else None
+        if ph is not None:
+            tr, svh, n2, inner = ph
+            b, q, k = logits.shape
+            x = logits.reshape(b * q, k)
+            xh = torch.empty_like(x)
+            y = torch.empty((b * q, n2), dtype = torch.half, device = x.device)
+            ext.exl3_gemm(x, tr, y, inner.suh, xh, svh, -1, inner.mcg, inner.mul1, 0)
+            logits = y.view(b, q, n2)
+            vocab_size = n2
+        else:
+            logits = lm.forward(logits, params)
         # [anchor, path...] and [0, score...] straight from the selector, in the block layout
         # the generator consumes. The head's padded width, the output multiplier and the
         # softcap (Gemma-class targets) are handled inside the selector's top-k. The state
@@ -301,13 +335,35 @@ class DFlash2Model(Model):
         out, confidence = self.selector.walk_block(
             to_device(state[:, 1:], dev), to_device(logits[:, 1:], dev), anchor,
             return_confidence = export_conf,
-            vocab_size = target.config.vocab_size,
+            vocab_size = vocab_size,
             scale = self.config.output_multiplier,
             softcap = self.config.final_logit_softcapping,
         )
         if export_conf:
             params["draft_conf"] = confidence
         return out
+
+
+    def _pruned_head(self, lm, device):
+        """Prefix slice of the shared EXL3 lm_head for drafting; None when the head is not a
+        plain EXL3 linear (dense/custom head) or the slice would be a no-op."""
+        cached = getattr(self, "_dfl3_pruned_head_cache", None)
+        if cached is not None:
+            return cached if cached is not False else None
+        inner = getattr(lm, "inner", None)
+        tr = getattr(inner, "trellis", None)
+        if tr is None or getattr(inner, "bias", None) is not None or not hasattr(inner, "svh"):
+            self._dfl3_pruned_head_cache = False
+            return None
+        n_full = tr.shape[1] * 16
+        n2 = min(_DFLASH_HEAD_N, n_full, self.attached_model().config.vocab_size) // 128 * 128
+        if n2 <= 0 or n2 >= n_full:
+            self._dfl3_pruned_head_cache = False
+            return None
+        tr2 = tr[:, :n2 // 16, :].contiguous().to(device)
+        svh2 = inner.svh[:n2].contiguous().to(device)
+        self._dfl3_pruned_head_cache = (tr2, svh2, n2, inner)
+        return self._dfl3_pruned_head_cache
 
 
     def default_load_shape_dtype(self, chunk_size):

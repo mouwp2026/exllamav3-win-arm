@@ -254,7 +254,14 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
             while (size_m > 0)
             {
                 int tm;
-                if constexpr (M_TILE >= 64)
+                if constexpr (M_TILE >= 112)
+                {
+                    if (size_m > 64)      { moe_gemm_tile<t_bits, cb, 112, MOE_TILESIZE_N, t_half>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 112; }
+                    else if (size_m > 32) { moe_gemm_tile<t_bits, cb, 64, MOE_TILESIZE_N, t_half>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 64; }
+                    else if (size_m > 16) { moe_gemm_tile<t_bits, cb, 32, MOE_TILESIZE_N, t_half>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 32; }
+                    else                  { moe_gemm_tile<t_bits, cb, 16, MOE_TILESIZE_N, t_half>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 16; }
+                }
+                else if constexpr (M_TILE >= 64)
                 {
                     if (size_m > 32)      { moe_gemm_tile<t_bits, cb, 64, MOE_TILESIZE_N, t_half>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 64; }
                     else if (size_m > 16) { moe_gemm_tile<t_bits, cb, 32, MOE_TILESIZE_N, t_half>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 32; }

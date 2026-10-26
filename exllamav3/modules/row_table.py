@@ -42,10 +42,12 @@ class _PinSet:
         self.event = None
         self.held = False
 
-    def grow(self, n: int, row_words: int, row_dtype: torch.dtype):
+    def grow(self, n: int, row_words: int, row_dtype: torch.dtype, device: torch.device | None = None):
+        tgt_type = (device or torch.device("cpu")).type
         if self.uids is None or self.uids.numel() < n or self.packed.shape[1] != row_words \
-                or self.packed.dtype != row_dtype:
-            self.packed = torch.empty((n, row_words), dtype = row_dtype, pin_memory = True)
+                or self.packed.dtype != row_dtype or self.packed.device.type != tgt_type:
+            self.packed = torch.empty((n, row_words), dtype = row_dtype, device = device,
+                                      pin_memory = device is None)
             self.inverse = torch.empty(n, dtype = torch.int64, pin_memory = True)
             self.heads = torch.empty(n, dtype = torch.int32, pin_memory = True)
             self.uids = torch.empty(n, dtype = torch.int64, pin_memory = True)
@@ -62,6 +64,7 @@ class RowTable:
         # but the last hold rows_per_shard rows
         self.stores = None
         self.on_disk = False
+        self.on_device = False
         self.rows_per_shard = None
         self.num_rows = 0
         self.row_words = None       # elements per stored row
@@ -92,6 +95,7 @@ class RowTable:
         assert all(s[1:] == shapes[0][1:] for s in shapes)
         self.stores = stores
         self.on_disk = isinstance(stores[0], DiskTensorHandle)
+        self.on_device = not self.on_disk and stores[0].is_cuda
         self.rows_per_shard = shapes[0][0] if len(stores) > 1 else sum(s[0] for s in shapes)
         self.num_rows = sum(s[0] for s in shapes)
         self.row_words = shapes[0][1]
@@ -190,7 +194,11 @@ class RowTable:
         """Gather rows of the backing store to CPU, in the order given. Reference form of the
         gather; lookup() runs the fast path."""
         def gather(s, local):
-            return self.stores[s].read_rows(local) if self.on_disk else self.stores[s].index_select(0, local)
+            if self.on_disk:
+                return self.stores[s].read_rows(local)
+            if self.on_device:
+                return self.stores[s].index_select(0, local.to(self.stores[s].device)).cpu()
+            return self.stores[s].index_select(0, local)
 
         if len(self.stores) == 1:
             return gather(0, uids_cpu)
@@ -255,7 +263,7 @@ class RowTable:
             self._retire(done[0] if done else self._pending[0])
             free = [p for p in self._pins if not p.held]
         pin = free[0]
-        pin.grow(n, self.row_words, self.row_dtype)
+        pin.grow(n, self.row_words, self.row_dtype, self.stores[0].device if self.on_device else None)
         pin.held = True
         return pin
 
@@ -310,7 +318,10 @@ class RowTable:
                         ext.ngram_gather_cpu(store._ensure_open(), store.abs_offset,
                                              store.row_bytes, seg.contiguous(), base, out[i0 : i1])
                 else:
-                    torch.index_select(store, 0, seg - base if base else seg, out = out[i0 : i1])
+                    idx = seg - base if base else seg
+                    if self.on_device:
+                        idx = idx.to(store.device)
+                    torch.index_select(store, 0, idx, out = out[i0 : i1])
             i0 = i1
 
     def prefetch(self, ids: torch.Tensor, n: int, resolve):

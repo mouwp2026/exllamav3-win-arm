@@ -1,4 +1,5 @@
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include "ngram.cuh"
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -365,7 +366,10 @@ void ngram_dequant_kernel
     float a = 0.0f;
     if (aux)
     {
+        // The loader validates the bias row count against the head count; the bound here keeps a
+        // bad head id from reading outside aux regardless (issue #525)
         int head = heads ? heads[r] : r % num_heads;
+        head = max(0, min(head, num_heads - 1));
         a = __half2float(aux[(size_t) head * dim + i]);
     }
 
@@ -437,5 +441,188 @@ void ngram_dequant
         aux ? (int) aux->size(0) : 1,
         rotate
     );
+    cuda_check(cudaPeekAtLastError());
+}
+
+// ---- PQ (product-quantized n-gram table) gather + decode, GX10 patch -------------------------
+//
+// A PQ table (util/_pq_to_pack.py) serves rows as M uint8 segment codes; a row decodes as
+// M per-segment 8-bit centroid lookups (fp16 or bf16 values) scaled by the PLE fp8
+// weight_scale. The reference form (ngram_embedding._pq_decode_rows) runs M index_selects
+// into an fp32 buffer plus a scale and a cast -- 2M+2 launches and a U x (M * seg) fp32
+// intermediate per chunk. These kernels fold gather + decode into a single launch that
+// writes the final dtype:
+//
+//   pq_decode_kernel (packed):  row codes arrive in the staging buffer (streamed/disk or RAM
+//                               tables) after the H2D copy
+//   pq_decode_kernel (table):   row codes are read straight from the device-resident table via
+//                               uids -- no intermediate row buffer exists at all
+//
+// One block per unique row, M * seg threads (160 for M=5/seg=32): thread i = m * seg + s
+// decodes codebook[(head * M + m) * K + code_m][s] * scale. The codebooks (heads * M * K * seg
+// values, 1.3 MiB for Qwen3.8-Flash-Next) stay L2-resident; every thread of one m reads the
+// same code byte, and consecutive s threads read one 64 B codebook span, so both gathers are
+// broadcast/coalesced. The codebook element type is templated: the pack ships bf16 centroids,
+// but conversions that emit fp16 or fp32 codebooks must decode bit-identically too.
+
+#define MAX_PQ_DIM 1024
+
+template <typename T>
+__device__ __forceinline__ float pq_cb_to_float(T v) { return (float) v; }
+template <>
+__device__ __forceinline__ float pq_cb_to_float(__half v) { return __half2float(v); }
+template <>
+__device__ __forceinline__ float pq_cb_to_float(__nv_bfloat16 v) { return __bfloat162float(v); }
+
+template <typename T>
+__global__ __launch_bounds__(MAX_PQ_DIM)
+void pq_decode_kernel
+(
+    const uint8_t* __restrict__ packed,     // (U, M) uint8, per-segment codes (packed path)
+    const uint8_t* __restrict__ table,      // (rows, M) uint8, device-resident table (gather path)
+    const int64_t* __restrict__ uids,       // (U) int64, gather path; unused when table == null
+    const int32_t* __restrict__ heads,      // (U) int32, table head of each row
+    const T* __restrict__ codebooks,        // (heads * M * K, seg), half/bf16/float
+    void* __restrict__ out,                 // (U, M * seg) half or bf16
+    const int out_bf16,
+    const int M,
+    const int K,
+    const int seg,
+    const float scale
+)
+{
+    const int r = blockIdx.x;
+    const int i = threadIdx.x;
+    const int m = i / seg;
+    const int s = i - m * seg;
+    const int head = heads[r];
+    const uint8_t code = (table != nullptr)
+        ? table[(size_t) uids[r] * (size_t) M + (size_t) m]
+        : packed[(size_t) r * (size_t) M + (size_t) m];
+    const float v = pq_cb_to_float(codebooks[((size_t) (head * M + m) * (size_t) K + code) * (size_t) seg + s]) * scale;
+    if (out_bf16)
+        ((__nv_bfloat16*) out)[(size_t) r * (size_t) (M * seg) + (size_t) i] = __float2bfloat16(v);
+    else
+        ((half*) out)[(size_t) r * (size_t) (M * seg) + (size_t) i] = __float2half_rn(v);
+}
+
+static void pq_decode_launch
+(
+    const void* packed,
+    const void* table,
+    const int64_t* uids,
+    const int32_t* heads,
+    const void* codebooks,
+    c10::ScalarType cb_dtype,
+    void* out,
+    bool out_bf16,
+    int M,
+    int K,
+    int seg,
+    float scale,
+    int64_t U,
+    cudaStream_t stream
+)
+{
+    const unsigned int grid = (unsigned int) U;
+    const unsigned int dim = (unsigned int) (M * seg);
+    switch (cb_dtype)
+    {
+        case at::kHalf:
+            pq_decode_kernel<__half><<<grid, dim, 0, stream>>>
+            (
+                (const uint8_t*) packed, (const uint8_t*) table, uids, heads,
+                (const __half*) codebooks, out, out_bf16 ? 1 : 0, M, K, seg, scale
+            );
+            break;
+        case at::kBFloat16:
+            pq_decode_kernel<__nv_bfloat16><<<grid, dim, 0, stream>>>
+            (
+                (const uint8_t*) packed, (const uint8_t*) table, uids, heads,
+                (const __nv_bfloat16*) codebooks, out, out_bf16 ? 1 : 0, M, K, seg, scale
+            );
+            break;
+        case at::kFloat:
+            pq_decode_kernel<float><<<grid, dim, 0, stream>>>
+            (
+                (const uint8_t*) packed, (const uint8_t*) table, uids, heads,
+                (const float*) codebooks, out, out_bf16 ? 1 : 0, M, K, seg, scale
+            );
+            break;
+        default:
+            TORCH_CHECK(false, "pq_decode: codebooks must be half, bfloat16 or float");
+    }
+}
+
+void ngram_pq_decode
+(
+    const at::Tensor& packed,               // (U, M) uint8 CUDA, contiguous
+    const at::Tensor& heads,                // (U) int32 CUDA, contiguous
+    const at::Tensor& codebooks,            // (heads * M * K, seg) half/bf16/float CUDA
+    at::Tensor out,                         // (U, M * seg) half or bf16 CUDA
+    int64_t K,
+    double scale
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(packed.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+    TORCH_CHECK(packed.device().is_cuda() && heads.device().is_cuda() && codebooks.device().is_cuda()
+                && out.device().is_cuda(), "ngram_pq_decode: CUDA tensors required");
+    TORCH_CHECK(packed.dtype() == at::kByte && heads.dtype() == at::kInt
+                && (codebooks.dtype() == at::kHalf || codebooks.dtype() == at::kBFloat16 || codebooks.dtype() == at::kFloat)
+                && (out.dtype() == at::kHalf || out.dtype() == at::kBFloat16), "ngram_pq_decode: dtypes");
+    TORCH_CHECK(packed.is_contiguous() && heads.is_contiguous() && codebooks.is_contiguous()
+                && out.is_contiguous(), "ngram_pq_decode: contiguous inputs required");
+    TORCH_CHECK(packed.dim() == 2 && codebooks.dim() == 2 && out.dim() == 2, "ngram_pq_decode: shapes");
+    const int64_t U = packed.size(0);
+    const int M = (int) packed.size(1);
+    const int seg = (int) codebooks.size(1);
+    const int dim = M * seg;
+    TORCH_CHECK(K > 0 && codebooks.size(0) % ((int64_t) M * K) == 0, "ngram_pq_decode: codebook shape");
+    TORCH_CHECK(heads.numel() >= U && out.size(0) >= U && (int) out.size(1) == dim, "ngram_pq_decode: out shape");
+    TORCH_CHECK(dim > 0 && dim <= MAX_PQ_DIM, "ngram_pq_decode: dim");
+    if (!U) return;
+
+    pq_decode_launch(packed.data_ptr(), nullptr, nullptr, (const int32_t*) heads.data_ptr(),
+                     codebooks.data_ptr(), codebooks.scalar_type(), out.data_ptr(),
+                     out.dtype() == at::kBFloat16, M, (int) K, seg, (float) scale, U, stream);
+    cuda_check(cudaPeekAtLastError());
+}
+
+void ngram_pq_gather_decode
+(
+    const at::Tensor& table,                // (rows, M) uint8 CUDA, contiguous; on-device table
+    const at::Tensor& uids,                 // (U) int64 CUDA, contiguous
+    const at::Tensor& heads,                // (U) int32 CUDA, contiguous
+    const at::Tensor& codebooks,            // (heads * M * K, seg) half/bf16/float CUDA
+    at::Tensor out,                         // (U, M * seg) half or bf16 CUDA
+    int64_t K,
+    double scale
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(table.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+    TORCH_CHECK(table.device().is_cuda() && uids.device().is_cuda() && heads.device().is_cuda()
+                && codebooks.device().is_cuda() && out.device().is_cuda(), "ngram_pq_gather_decode: CUDA tensors required");
+    TORCH_CHECK(table.dtype() == at::kByte && uids.dtype() == at::kLong && heads.dtype() == at::kInt
+                && (codebooks.dtype() == at::kHalf || codebooks.dtype() == at::kBFloat16 || codebooks.dtype() == at::kFloat)
+                && (out.dtype() == at::kHalf || out.dtype() == at::kBFloat16), "ngram_pq_gather_decode: dtypes");
+    TORCH_CHECK(table.is_contiguous() && uids.is_contiguous() && heads.is_contiguous()
+                && codebooks.is_contiguous() && out.is_contiguous(), "ngram_pq_gather_decode: contiguous inputs required");
+    TORCH_CHECK(table.dim() == 2 && codebooks.dim() == 2 && out.dim() == 2, "ngram_pq_gather_decode: shapes");
+    const int64_t U = uids.numel();
+    const int M = (int) table.size(1);
+    const int seg = (int) codebooks.size(1);
+    const int dim = M * seg;
+    TORCH_CHECK(K > 0 && codebooks.size(0) % ((int64_t) M * K) == 0, "ngram_pq_gather_decode: codebook shape");
+    TORCH_CHECK(heads.numel() >= U && out.size(0) >= U && (int) out.size(1) == dim, "ngram_pq_gather_decode: out shape");
+    TORCH_CHECK(dim > 0 && dim <= MAX_PQ_DIM, "ngram_pq_gather_decode: dim");
+    if (!U) return;
+
+    pq_decode_launch(nullptr, table.data_ptr(), (const int64_t*) uids.data_ptr(),
+                     (const int32_t*) heads.data_ptr(), codebooks.data_ptr(), codebooks.scalar_type(),
+                     out.data_ptr(), out.dtype() == at::kBFloat16, M, (int) K, seg, (float) scale, U, stream);
     cuda_check(cudaPeekAtLastError());
 }

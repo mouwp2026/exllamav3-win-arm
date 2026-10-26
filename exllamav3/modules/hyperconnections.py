@@ -18,6 +18,11 @@ _GR_INT8 = os.environ.get("EXL3_GR_INT8", "1") != "0"
 # Prefill-sized GatedResidual mixes run the tiled deterministic kernel (rank-consistent under
 # TP, see hc_mix_tiled.cu); 0 falls back to the cuBLAS GEMM path
 _gr_mix_tiled_enable = os.environ.get("EXL3_GR_MIX_TILED", "1") != "0"
+# fp16 dots stage for the tiled prefill path (gr_mix_tiled_f16). It reads the resident
+# fp16 projection instead of re-quantising it to an int8 Ozaki pair per call: 13.26 ->
+# 7.08 ms for the projection GEMM at R=32768. Trade-off: the dots accumulator is no
+# longer bit-identical across architectures. Set EXL3_GR_F16_DOTS=0 for the int8 path.
+_gr_f16_dots = os.environ.get("EXL3_GR_F16_DOTS", "1") != "0"
 
 # Decode row counts: launch-count folds for the mHC sites (hc_mix_fused, hc_fuse.cuh). apply_ defers its
 # residual update into the next site's mix, and the RMSNorm a block runs after a mix executes inside its
@@ -423,6 +428,7 @@ class GatedResidual(Module):
         self.tiled = _gr_mix_tiled_enable and H == 4 and Dh % 128 == 0 and self.rank % 64 == 0 \
             and Mpad <= 512 and ext.HAS_GR_MIX_TILED and dev.type == "cuda" \
             and torch.cuda.get_device_capability(dev)[0] >= 8
+        self.f16_dots = self.tiled and _gr_f16_dots and hasattr(ext, "gr_mix_tiled_f16")
         self.up_h = up.half().contiguous()          # (H * D, rank), checkpoint orientation
         # up repacked (H, D/4, rank, 4) so the fused kernel's rank loop reads lane-contiguous
         self.upx_h = self.up_h.view(H, Dh // 4, 4, self.rank) \
@@ -544,21 +550,27 @@ class GatedResidual(Module):
             return None
         return xw
 
-    def _tiled_tables(self, ws):
-        """Per-call int8 hi/lo tables (+ per-row fp32 scales) for the tiled kernel, derived from
-        the resident fp16 tables: det_quant_weight is a deterministic per-row split, so the
-        bytes match a stored copy. up goes back to its checkpoint orientation first."""
+    def _tiled_up(self, ws):
+        """Int8 hi/lo table (+ per-row fp32 scales) for the gate GEMM, from the resident fp16
+        tables: det_quant_weight is a deterministic per-row split, so the bytes match a stored
+        copy. up goes back to its checkpoint orientation first."""
         H, Dh = self.hc_mult, self.hidden_size
-        Mpad = self.proj_h.shape[0]
-        proj_i8 = ws((2, Mpad, H * Dh), torch.int8)
-        proj_sb = ws((Mpad,), torch.float)
-        ext.det_quant_weight(self.proj_h, proj_i8, proj_sb)
         up = ws((H * Dh, self.rank), torch.half).view(H, Dh // 4, 4, self.rank)
         up.copy_(self.upx_h.permute(0, 1, 3, 2))
         up = up.view(H * Dh, self.rank)
         up_i8 = ws((2, H * Dh, self.rank), torch.int8)
         up_sb = ws((H * Dh,), torch.float)
         ext.det_quant_weight(up, up_i8, up_sb)
+        return up_i8, up_sb
+
+    def _tiled_tables(self, ws):
+        """Per-call int8 hi/lo tables for the fully int8 tiled kernel (proj + up)."""
+        H, Dh = self.hc_mult, self.hidden_size
+        Mpad = self.proj_h.shape[0]
+        proj_i8 = ws((2, Mpad, H * Dh), torch.int8)
+        proj_sb = ws((Mpad,), torch.float)
+        ext.det_quant_weight(self.proj_h, proj_i8, proj_sb)
+        up_i8, up_sb = self._tiled_up(ws)
         return proj_i8, proj_sb, up_i8, up_sb
 
     def _mix(self, streams: torch.Tensor, cached: bool = True, params: dict | None = None):
@@ -604,16 +616,26 @@ class GatedResidual(Module):
                 buf = torch.empty((1 << (numel - 1).bit_length(),), dtype = dtype, device = dev)
                 return buf[: numel].view(shape)
             Mpad = self.proj_h.shape[0]
-            proj_i8, proj_sb, up_i8, up_sb = self._tiled_tables(ws)
             S = ext.gr_mix_tiled_slices(R, Dh, Mpad)
             Rpad = -(-R // 64) * 64
             post = ws((R, H), torch.float) if self.use_combine else None
             mixed = ws((R, Dh), torch.half)
-            ext.gr_mix_tiled(
-                s3, self.w_h, proj_i8, proj_sb, up_i8, up_sb, self.rms_eps, self.proj_m,
-                ws((S, Rpad, Mpad), torch.float), ws((S, Rpad), torch.float), ws((R, H), torch.float),
-                ws((2, R, self.rank), torch.int8), ws((R, self.rank // 64), torch.float), post, mixed
-            )
+            # The fp16 dots stage takes proj_h and w_h straight, so the projection is never
+            # quantised on this path; only the gate GEMM still needs int8 up tables.
+            if self.f16_dots:
+                up_i8, up_sb = self._tiled_up(ws)
+                ext.gr_mix_tiled_f16(
+                    s3, self.w_h, self.proj_h, up_i8, up_sb, self.rms_eps, self.proj_m,
+                    ws((S, Rpad, Mpad), torch.float), ws((S, Rpad), torch.float), ws((R, H), torch.float),
+                    ws((2, R, self.rank), torch.int8), ws((R, self.rank // 64), torch.float), post, mixed
+                )
+            else:
+                proj_i8, proj_sb, up_i8, up_sb = self._tiled_tables(ws)
+                ext.gr_mix_tiled(
+                    s3, self.w_h, proj_i8, proj_sb, up_i8, up_sb, self.rms_eps, self.proj_m,
+                    ws((S, Rpad, Mpad), torch.float), ws((S, Rpad), torch.float), ws((R, H), torch.float),
+                    ws((2, R, self.rank), torch.int8), ws((R, self.rank // 64), torch.float), post, mixed
+                )
         else:
             self._require_source_weights("the cuBLAS path")
             post = torch.empty((R, H), dtype = torch.float, device = dev) \

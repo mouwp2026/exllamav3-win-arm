@@ -1,3 +1,4 @@
+import os
 """
 Triton kernels for the QSA indexer stages of the graph-captured decode path (BC_Attention,
 Qwen3.8-Flash-Next). The selection machinery is shared with the DSA/kpool stack: the raw-key
@@ -250,6 +251,36 @@ def _qsa_sparse_split_kernel(
         tl.store(partial_ml + ml_base + rows * 2 + 1, l)
 
 
+_qsa_dump_done = [False]
+_qsa_dump_calls = [0]
+
+def _maybe_dump_indices(indices):
+    """M1b instrumentation: dump one indices tensor (env-gated, one shot) for overlap analysis."""
+    import os
+    path = os.environ.get('EXL3_QSA_DUMP')
+    if not path:
+        return
+    min_rows = int(os.environ.get('EXL3_QSA_DUMP_MIN_ROWS', '8192'))
+    if indices.shape[0] < min_rows:
+        return
+    _qsa_dump_calls[0] += 1
+    at = int(os.environ.get('EXL3_QSA_DUMP_AT', '-1'))
+    if at >= 0 and _qsa_dump_calls[0] - 1 != at:
+        return
+    if_max = int(os.environ.get('EXL3_QSA_DUMP_IF_MAX', '0'))
+    if if_max > 0 and int(indices.max()) < if_max:
+        return
+    try:
+        rows = min(int(os.environ.get('EXL3_QSA_DUMP_ROWS', '8192')), indices.shape[0])
+        sub = indices[:rows].detach().to('cpu')
+        torch.save({'indices': sub, 'shape': tuple(indices.shape),
+                    'max': int(indices.max()), 'call': _qsa_dump_calls[0] - 1}, path)
+        print(f'[QSA-DUMP] call={_qsa_dump_calls[0] - 1} saved {tuple(sub.shape)} '
+              f'of {tuple(indices.shape)} max={int(indices.max())} -> {path}', flush=True)
+    except Exception as e:
+        print(f'[QSA-DUMP] failed: {e}', flush=True)
+
+
 _sm_counts = {}
 
 def _get_sms(dev):
@@ -278,6 +309,7 @@ def qsa_sparse_attend_rows(
     rows (decode fallback) still fill the device. Returns (R, n_q_heads, head_dim) fp16."""
     from .triton_paged import _paged_attn_decode_combine_kernel
     R, H, hd = q.shape
+    _maybe_dump_indices(indices)
     if qc is not None:
         k_scales, v_scales, k_bits, v_bits = qc
         assert n_kv_heads is not None and block_table is not None, \
@@ -289,8 +321,9 @@ def qsa_sparse_attend_rows(
         kvh = k.shape[1]
         h32 = q
     group = H // kvh
-    BLOCK_H = 16
-    BLOCK_N = 32
+    # M1: launch params env-tunable (numerics unchanged)
+    BLOCK_H = int(os.environ.get("EXL3_QSA_BLOCK_H", "16"))
+    BLOCK_N = int(os.environ.get("EXL3_QSA_BLOCK_N", "32"))
     h_blocks = triton.cdiv(group, BLOCK_H)
     programs = R * kvh * h_blocks
     K_pad = indices.shape[1]
@@ -318,7 +351,8 @@ def qsa_sparse_attend_rows(
             head_dim = hd, K_pad = K_pad, scale = float(sm_scale),
             BLOCK_H = BLOCK_H, BLOCK_N = BLOCK_N, PAGED = 1 if paged else 0,
             QCK = k_bits, QCV = v_bits,
-            num_warps = 4, num_stages = 2,
+            num_warps = int(os.environ.get("EXL3_QSA_WARPS", "4")),
+            num_stages = int(os.environ.get("EXL3_QSA_STAGES", "2")),
         )
         rows_sub, d_sub = combine_subtiles(BLOCK_H, hd)
         _paged_attn_decode_combine_kernel[(programs, (BLOCK_H // rows_sub) * (hd // d_sub))](

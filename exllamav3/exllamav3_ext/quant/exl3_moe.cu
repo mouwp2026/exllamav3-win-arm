@@ -32,6 +32,21 @@ static int moe_tile_n_override()
     return v;
 }
 
+// Expert group width for the CUDA MoE launch (blocks per expert). MOE_SMS_PER_EXPERT is the
+// compile-time default; EXL3_MOE_SMS_PER_EXPERT overrides it at runtime. It also sizes the temp
+// buffers through exl3_moe_max_concurrency, so it must be set before the model loads
+static int moe_sms_per_expert()
+{
+    static int v = -1;
+    if (v < 0)
+    {
+        const char* e = getenv("EXL3_MOE_SMS_PER_EXPERT");
+        v = e ? atoi(e) : MOE_SMS_PER_EXPERT;
+        if (v < 1 || v > MOE_MAX_SMS_PER_EXPERT) v = MOE_SMS_PER_EXPERT;
+    }
+    return v;
+}
+
 fp_exl3_moe_kernel exl3_moe_kernel_instances[] =
 {
     // [K][cb - 1][N_off]: K = 0 switches Kg/Ku/Kd at runtime, K > 0 = compile-time Kg = Ku = Kd
@@ -147,7 +162,7 @@ int exl3_moe_max_concurrency(int device)
 int exl3_moe_max_concurrency(int device)
 {
     int num_sms = DevCtx::instance().get_num_sms(device);
-    return num_sms / MOE_SMS_PER_EXPERT;
+    return num_sms / moe_sms_per_expert();
 }
 
 // 32-row tile instances, [K], N = 128 shape, mul1 codebook only
@@ -164,6 +179,14 @@ fp_exl3_moe_kernel exl3_moe_kernel_instances_m64[] =
     exl3_moe_kernel_k0_n128_cb2_m64(), exl3_moe_kernel_k1_n128_cb2_m64(), exl3_moe_kernel_k2_n128_cb2_m64(),
     exl3_moe_kernel_k3_n128_cb2_m64(), exl3_moe_kernel_k4_n128_cb2_m64(), exl3_moe_kernel_k5_n128_cb2_m64(),
     exl3_moe_kernel_k6_n128_cb2_m64(), exl3_moe_kernel_k7_n128_cb2_m64(), exl3_moe_kernel_k8_n128_cb2_m64()
+};
+
+// M2e: 112-row tile instances, [K], N = 128, mul1 codebook only (see exl3_moe_instances.cuh)
+fp_exl3_moe_kernel exl3_moe_kernel_instances_m112[] =
+{
+    exl3_moe_kernel_k0_n128_cb2_m112(), exl3_moe_kernel_k1_n128_cb2_m112(), exl3_moe_kernel_k2_n128_cb2_m112(),
+    exl3_moe_kernel_k3_n128_cb2_m112(), exl3_moe_kernel_k4_n128_cb2_m112(), exl3_moe_kernel_k5_n128_cb2_m112(),
+    exl3_moe_kernel_k6_n128_cb2_m112(), exl3_moe_kernel_k7_n128_cb2_m112(), exl3_moe_kernel_k8_n128_cb2_m112()
 };
 
 // Uniform half-integer rates K + 0.5 (mul1 codebook only): [K - 1][N_off] and the wide row tiles [K - 1]
@@ -450,6 +473,8 @@ void exl3_moe
         TORCH_CHECK(max_tokens_per_expert >= (size_t) m_tile, "exl3_moe: temp buffers hold fewer rows than the tile");
         if (half_k)
             kernel = m_tile >= 64 ? exl3_moe_kernel_instances_h_m64[K - 1] : exl3_moe_kernel_instances_h_m32[K - 1];
+        else if (m_tile >= 112)
+            kernel = exl3_moe_kernel_instances_m112[K];
         else
             kernel = m_tile >= 64 ? exl3_moe_kernel_instances_m64[K] : exl3_moe_kernel_instances_m32[K];
     }
@@ -487,9 +512,9 @@ void exl3_moe
     }
     const int launch_smem = pipe ? moe_pipe_smem(N_off ? 256 : 128) : smem_max;
 #else
-    TORCH_CHECK(concurrency * MOE_SMS_PER_EXPERT <= num_sms, "Concurrency too high for device num_sms");
+    TORCH_CHECK(concurrency * moe_sms_per_expert() <= num_sms, "Concurrency too high for device num_sms");
     int num_groups = MIN((int) concurrency, MOE_MAX_GROUPS);
-    int group_size = MOE_SMS_PER_EXPERT;
+    int group_size = moe_sms_per_expert();
     if (num_active > 0)
     {
         num_groups = MIN(num_groups, num_active);
@@ -752,7 +777,7 @@ static int exl3_moe_mixedk_blocks_per_sm()
 // fit the SM count x blocks-per-SM
 static bool exl3_moe_groups_ok(size_t concurrency, int target_blocks)
 {
-    return concurrency * MOE_SMS_PER_EXPERT <= (size_t) target_blocks;
+    return concurrency * moe_sms_per_expert() <= (size_t) target_blocks;
 }
 
 static bool exl3_moe_mixedk_debug_done = false;
@@ -920,7 +945,7 @@ void exl3_moe_mixedk
     TORCH_CHECK(exl3_moe_groups_ok(concurrency, target_blocks),
                 "Concurrency too high for device num_sms");
     int num_groups = MIN((int) concurrency, MOE_MAX_GROUPS);
-    int group_size = MOE_SMS_PER_EXPERT;
+    int group_size = moe_sms_per_expert();
     if (num_active > 0)
     {
         num_groups = MIN(num_groups, num_active);

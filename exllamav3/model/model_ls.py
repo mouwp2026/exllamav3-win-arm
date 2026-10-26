@@ -92,6 +92,10 @@ class Model_LSMixin(ABC):
         prev_load_device = None
         touched_devices = []
         params = self.default_load_params(max_chunk_size)
+        # EXL3_AUTOSPLIT_FWD_MAX: cap the chunk used only by the load-time measuring forward
+        dummy_c = int(os.environ.get("EXL3_AUTOSPLIT_FWD_MAX", "0")) or max_chunk_size
+        if dummy_c < max_chunk_size:
+            backup_shape = (backup_shape[0], dummy_c) + tuple(backup_shape[2:])
         # The measuring forwards below exist to observe VRAM allocation; modules with CPU-side
         # compute (CPU-offloaded experts) can skip the host work when they see this flag
         params["autosplit_measure"] = True
@@ -106,9 +110,9 @@ class Model_LSMixin(ABC):
                     "attn_mode": "flash_attn",
                     "cache": cache,
                     "past_len": 0,
-                    "batch_shape": (1, max_chunk_size),
+                    "batch_shape": (1, dummy_c),
                 })
-                prepare_for_attn(torch.zeros((1, max_chunk_size), dtype = torch.long), params)
+                prepare_for_attn(torch.zeros((1, dummy_c), dtype = torch.long), params)
                 rl = [m for m in self if m.caps.get("recurrent_cache")]
                 if rl:
                     prepare_for_recurrence(None, params, self)

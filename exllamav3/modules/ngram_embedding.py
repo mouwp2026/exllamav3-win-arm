@@ -1,5 +1,8 @@
 from __future__ import annotations
 from typing_extensions import override
+import json
+import os
+import sys
 import torch
 from ..model.config import Config
 from ..ext import exllamav3_ext as ext
@@ -20,6 +23,12 @@ pass actually touches (see RowTable). The module is quantization-agnostic:
 
 crossed with resident (RAM) or streamed (disk) storage gives four load modes, all returning
 identical results for the same table contents.
+
+PQ mode (local patch, GX10): when EXL3_NGRAM_PQ_META points at a meta.json produced by
+pq_to_pack.py, the table is served from product-quantized uint8 codes (M bytes/row) with
+per-head codebooks. Row math: row = concat(codebook[head][m][code_m]). Codes stream from disk
+through the same RowTable machinery (or stay in page cache), so prefill reads ~5 B/row instead
+of 102 B/row. Lossy by construction; gate quality with NLL/needle checks.
 """
 
 
@@ -37,6 +46,20 @@ def _find_nth_prime_after(start: int, count: int) -> int:
         while not is_prime(p):
             p += 1
     return p
+
+
+_MASK64 = (1 << 64) - 1
+_SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
+_SPLITMIX_M1 = 0xBF58476D1CE4E5B9
+_SPLITMIX_M2 = 0x94D049BB133111EB
+_PLE_LAYER_PRIME = 10007
+
+
+def _splitmix64(value: int) -> int:
+    value = (value + _SPLITMIX_GAMMA) & _MASK64
+    value = ((value ^ (value >> 30)) * _SPLITMIX_M1) & _MASK64
+    value = ((value ^ (value >> 27)) * _SPLITMIX_M2) & _MASK64
+    return (value ^ (value >> 31)) & _MASK64
 
 
 class NGramEmbedding(Module):
@@ -77,14 +100,28 @@ class NGramEmbedding(Module):
         self.head_vocab_sizes = None
         self.layer_multipliers = None
         self.codebook = None
+        self.pq = None              # PQ patch: dict(meta, codebooks) when active
+        self._cb_dev = None         # PQ patch: device-resident [heads*M*K, seg] codebooks
+        self._pq_scale = 1.0        # PQ patch: folded PLE fp8 weight_scale
+        self._pq_vram = False       # PQ patch: fused gather+decode straight from the device table
+        self._pq_k = None           # PQ patch: codebook size per segment
+        self._pq_seg = None         # PQ patch: centroid width
+        self._pq_m = None           # PQ patch: segments per row
+        self._codes_2d = None       # PQ patch: device-resident (rows, M) uint8 codes
+        self._v_pin = None          # PQ patch: pinned hash buffers for the fused path
 
         self.caps.update({"prefer_cpu": True})
 
     @property
     def mode(self):
-        """"trellis_disk" | "trellis_ram" | "fp16_disk" | "fp16_ram", None when not loaded"""
+        """"trellis_disk" | "trellis_ram" | "fp16_disk" | "fp16_ram" | "pq_disk" | "pq_ram" | "pq_vram",
+        None when not loaded"""
         if self.table is None:
             return None
+        if self.pq is not None:
+            if self.table.on_device:
+                return "pq_vram"
+            return "pq_disk" if self.table.on_disk else "pq_ram"
         return ("trellis" if self.K else "fp16") + ("_disk" if self.table.on_disk else "_ram")
 
     @property
@@ -94,6 +131,129 @@ class NGramEmbedding(Module):
     @override
     def optimizer_targets(self):
         return []
+
+    # ---- PQ patch -----------------------------------------------------------------------------
+
+    def _pq_multipliers(self, meta: dict) -> list[int]:
+        # port of vllm/models/qwen3_8_flash_next/nvidia/ple_layer.py multiplier derivation
+        vocab = int(meta["vocab_size"])
+        half_bound = max(1, (((1 << 63) - 1) // vocab) // 2)
+        base_seed = int(meta.get("seed", 1234)) + _PLE_LAYER_PRIME * int(meta.get("ple_layer_id", 0))
+        out = []
+        for index in range(self.ngram_size):
+            value = base_seed + _SPLITMIX_GAMMA * (index + 1)
+            out.append(2 * (_splitmix64(value) % half_bound) + 1)
+        return out
+
+    def _load_pq(self, meta_path: str):
+        from ..loader.safetensors import DiskTensorHandle
+        with open(meta_path) as f:
+            meta = json.load(f)
+        base = os.path.dirname(os.path.abspath(meta_path))
+        codebooks = torch.load(os.path.join(base, meta["codebooks"]), map_location="cpu")
+        assert codebooks.shape[0] == self.num_heads, (codebooks.shape, self.num_heads)
+        assert int(meta["M"]) * int(meta["seg_dim"]) == ROW_DIM
+        self.pq = {"meta": meta, "codebooks": codebooks}
+        self._pq_scale = float(meta.get("scale", 1.0))
+        self.head_offsets = torch.tensor([int(x) for x in meta["offs"][: self.num_heads]], dtype = torch.long)
+        self.head_vocab_sizes = torch.tensor([int(x) for x in meta["sizes"][: self.num_heads]], dtype = torch.long)
+        self.layer_multipliers = torch.tensor(self._pq_multipliers(meta), dtype = torch.long)
+        assert self.layer_multipliers.numel() == self.ngram_size
+        self.head_bias = None
+        self.codebook = None
+        codes_path = os.path.join(base, meta["codes"])
+        shape = [int(meta["rows"]), int(meta["M"])]
+        key = f"{self.key}.pqcodes"
+        if os.environ.get("EXL3_NGRAM_PQ_VRAM", "0") == "1":
+            # VRAM patch: one full read + H2D at load, then the store lives on the device; the
+            # fused gather+decode kernel reads it directly, so no staging buffer is involved
+            flat = torch.from_file(codes_path, shared = False, size = shape[0] * shape[1], dtype = torch.uint8)
+            codes_2d = flat.view(shape).to(self.device)
+            table = RowTable(self.key, [key])
+            table._set_stores([codes_2d])
+            del flat
+            self._codes_2d = codes_2d
+            self._pq_vram = hasattr(ext, "ngram_pq_gather_decode")
+            if not self._pq_vram:
+                print(f"{self.key}: fused PQ kernel missing from exllamav3_ext; "
+                      "pq_vram falls back to the device-resident index_select path", file = sys.stderr)
+            else:
+                print(f"{self.key}: PQ table resident on device ({codes_2d.nbytes / 2**30:.2f} GiB, "
+                      "fused gather+decode)", flush = True)
+        elif os.environ.get("EXL3_NGRAM_PQ_RAM", "0") == "1":
+            flat = torch.from_file(codes_path, shared = False, size = shape[0] * shape[1], dtype = torch.uint8)
+            table = RowTable(self.key, [key])
+            table._set_stores([flat.view(shape)])
+        else:
+            handle = DiskTensorHandle(key = key, filename = codes_path, abs_offset = 0, shape = shape, dtype = torch.uint8)
+            table = RowTable(self.key, [key])
+            table._set_stores([handle])
+        self.table = table
+        self.num_rows = int(meta["rows"])
+        self.K = None
+        self._pq_k = int(meta["K"])
+        self._pq_seg = int(meta["seg_dim"])
+        self._pq_m = int(meta["M"])
+        self._ensure_codebook()
+
+    def _ensure_codebook(self) -> torch.Tensor:
+        if self._cb_dev is None:
+            meta = self.pq["meta"]
+            self._cb_dev = self.pq["codebooks"].view(-1, int(meta["seg_dim"])).to(self.device)
+            self._pq_scale = float(meta.get("scale", 1.0))
+        return self._cb_dev
+
+    def _pq_decode_rows(self, codes: torch.Tensor, heads: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+        meta = self.pq["meta"]
+        M = int(meta["M"]); K = int(meta["K"]); seg = int(meta["seg_dim"])
+        self._ensure_codebook()
+        if codes.is_cuda and hasattr(ext, "ngram_pq_decode"):
+            # fused decode: one launch, final dtype written directly; heads stay on device
+            out = torch.empty((codes.shape[0], M * seg), dtype = out_dtype, device = codes.device)
+            ext.ngram_pq_decode(codes, heads.to(torch.int32), self._cb_dev, out, K, self._pq_scale)
+            return out
+        # CPU reference path (host codes in tests/fetch_rows): M index_selects into fp32
+        heads = heads.to(torch.int64)
+        out = torch.empty((codes.shape[0], M * seg), dtype = torch.float32, device = codes.device)
+        for m in range(M):
+            idx = (heads * M + m) * K + codes[:, m].to(torch.int64)
+            out[:, m * seg : (m + 1) * seg] = self._cb_dev.index_select(0, idx)
+        # the vLLM runtime multiplies the codebook lookup by the PLE fp8 weight_scale
+        out.mul_(self._pq_scale)
+        return out.to(out_dtype)
+
+    def _bump_vpin(self, n: int) -> dict:
+        # pinned host buffers for the fused pq_vram path (hash outputs; no RowTable staging)
+        pin = self._v_pin
+        if pin is None or pin["uids"].numel() < n:
+            pin = {
+                "uids": torch.empty(n, dtype = torch.int64, pin_memory = True),
+                "inverse": torch.empty(n, dtype = torch.int64, pin_memory = True),
+                "heads": torch.empty(n, dtype = torch.int32, pin_memory = True),
+            }
+            self._v_pin = pin
+        return pin
+
+    def _forward_pq_vram(self, ids: torch.Tensor, bsz: int, out_len: int, out_dtype) -> torch.Tensor:
+        # Fused path: hash on the CPU (where the ids live), then one gather+decode launch that
+        # reads the device-resident codes table directly and writes (U, M * seg) in one pass.
+        H = self.num_heads
+        n = bsz * out_len * H
+        pin = self._bump_vpin(n)
+        dev = self.device
+        U = ext.ngram_hash_cpu(
+            ids, out_len,
+            self.layer_multipliers, self.head_offsets, self.head_vocab_sizes,
+            self.heads_per_ngram, self.eos_token_id,
+            pin["uids"], pin["inverse"], pin["heads"])
+        uids = pin["uids"][:U].to(dev, non_blocking = True)
+        heads = pin["heads"][:U].to(dev, non_blocking = True)
+        # the kernel writes one decoded row per unique uid: (U, M * seg), not the per-position
+        # (bsz * out_len, H * ROW_DIM); the inverse gather below expands to positions
+        rows = torch.empty((U, self._pq_m * self._pq_seg), dtype = torch.bfloat16, device = dev)
+        ext.ngram_pq_gather_decode(self._codes_2d, uids, heads, self._cb_dev, rows, self._pq_k, self._pq_scale)
+        out = rows.index_select(0, pin["inverse"][:n].to(dev, non_blocking = True))
+        return out.view(bsz, out_len, H * ROW_DIM).to(out_dtype or self.out_dtype or torch.half)
 
     def _load_aux(self, names: dict[str, str]):
         stc = self.config.stc
@@ -111,7 +271,13 @@ class NGramEmbedding(Module):
         self.layer_multipliers = get(names["multipliers"]).long().contiguous()
         bias = get(names["bias"], optional = True) if "bias" in names else None
         self.head_bias = bias.half().contiguous().to(self.device) if bias is not None else None
-        assert self.head_offsets.shape[0] == self.num_heads
+        assert self.head_offsets.shape[0] == self.num_heads, \
+            f"{self.key}: head_offsets holds {self.head_offsets.shape[0]} rows for {self.num_heads} heads"
+        # The dequant kernel indexes the bias by the per-row head id, which is bounded by the head
+        # count the config implies; the tensor's own row count has to match or a malformed
+        # checkpoint reads past it (issue #525)
+        assert self.head_bias is None or self.head_bias.shape[0] == self.num_heads, \
+            f"{self.key}: head_bias holds {self.head_bias.shape[0]} rows for {self.num_heads} heads"
         # These were buffered reads of the table file. On Windows a buffered file object (even a
         # closed one, for a few seconds) throttles the unbuffered row gathers on the same file, so
         # release the loader's handle now rather than at the end of the load
@@ -121,6 +287,10 @@ class NGramEmbedding(Module):
     @override
     def load(self, device: torch.device, **kwargs):
         self.device = device
+        pq_meta = os.environ.get("EXL3_NGRAM_PQ_META")
+        if pq_meta and os.path.isfile(pq_meta):
+            self._load_pq(pq_meta)
+            return
         stc = self.config.stc
         parent = self.key.rsplit(".", 1)[0]
 
@@ -172,6 +342,15 @@ class NGramEmbedding(Module):
         self.head_vocab_sizes = None
         self.layer_multipliers = None
         self.codebook = None
+        self.pq = None
+        self._cb_dev = None
+        self._pq_scale = 1.0
+        self._pq_vram = False
+        self._pq_k = None
+        self._pq_seg = None
+        self._pq_m = None
+        self._codes_2d = None
+        self._v_pin = None
 
     @override
     def get_tensors(self):
@@ -191,6 +370,7 @@ class NGramEmbedding(Module):
         parameters.
         """
         assert self.table is not None, "Cannot export module for TP before loading."
+        assert not self.table.on_device, "A device-resident PQ table cannot be TP-exported (each rank would need its own copy)."
         return {
             "cls": NGramEmbedding,
             "kwargs": {
@@ -229,6 +409,11 @@ class NGramEmbedding(Module):
         """Unique row indices (any device) -> decoded (N, 160) rows on the module's device.
         Reference form of the row pipeline (torch codec); forward() runs the fast path."""
         raw = self.table.fetch(uids.to("cpu", torch.int64)).to(self.device)
+        if self.pq is not None:
+            heads = (torch.searchsorted(self.head_offsets.to(self.device),
+                                        uids.to(self.device, torch.int64),
+                                        right = True) - 1).clamp(0, self.num_heads - 1)
+            return self._pq_decode_rows(raw, heads, out_dtype)
         if self.K:
             heads = (torch.searchsorted(self.head_offsets.to(self.device),
                                         uids.to(self.device, torch.int64),
@@ -310,6 +495,9 @@ class NGramEmbedding(Module):
         return pin.uids[:U], False
 
     def _decode(self, packed: torch.Tensor, pin, U: int) -> torch.Tensor:
+        if self.pq is not None:
+            heads = pin.heads[:U].to(packed.device, non_blocking = True)
+            return self._pq_decode_rows(packed[:U], heads, torch.bfloat16)
         if not self.K:
             return packed.float()
         heads = pin.heads[:U].to(packed.device, non_blocking = True)
@@ -322,7 +510,7 @@ class NGramEmbedding(Module):
         Stage the rows for a coming forward over `history`, the exact (bsz, context + seq) id
         history that forward() will receive, on a worker thread. Decode-sized inputs are ignored.
         """
-        if self.table is None or history.dim() != 2:
+        if self.table is None or history.dim() != 2 or self._pq_vram:
             return
         n = history.shape[0] * (history.shape[1] - self.context_len)
         if n >= PREFETCH_MIN_TOKENS:
@@ -342,6 +530,8 @@ class NGramEmbedding(Module):
         out_len = x.shape[1] - self.context_len
         ids = x.to("cpu", torch.int64).contiguous()
         bsz = ids.shape[0]
+        if self._pq_vram:
+            return self._forward_pq_vram(ids, bsz, out_len, out_dtype)
         H = self.num_heads
         out = self.table.lookup(ids, bsz * out_len * H, self._resolve, self._decode, self.device)
         return out.view(bsz, out_len, H * ROW_DIM).to(out_dtype or self.out_dtype or torch.half)

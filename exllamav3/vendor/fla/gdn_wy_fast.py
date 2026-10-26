@@ -6,6 +6,7 @@
 #   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
 
+import os
 import torch
 import triton
 import triton.language as tl
@@ -106,8 +107,8 @@ def recompute_w_u_fwd(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     B, T, H, K, V, HV = *k.shape, v.shape[-1], v.shape[2]
     BT = A.shape[-1]
-    BK = 64
-    BV = 64
+    BK = int(os.environ.get("EXL3_GDN_WU_BK", "64"))
+    BV = int(os.environ.get("EXL3_GDN_WU_BV", "64"))
 
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)

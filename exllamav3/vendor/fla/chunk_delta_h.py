@@ -6,6 +6,7 @@
 #   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
 
+import os
 import torch
 import triton
 import triton.language as tl
@@ -14,6 +15,16 @@ from .index import prepare_chunk_offsets
 from .op import exp2
 from .utils import autotune_cache_kwargs
 from .utils import autotune
+
+def _warps_h(dev):
+    """EXL3_GDN_H_WARPS overrides the autotune warp set (upstream excludes 4/8 on
+    Blackwell, which has never been measured on GB10 / sm_121)."""
+    o = os.environ.get("EXL3_GDN_H_WARPS")
+    if o:
+        return sorted({int(x) for x in o.split(",") if x.strip()})
+    return [2] if dev.blackwell else [2, 4, 8]
+
+
 
 
 @triton.heuristics({
@@ -27,7 +38,7 @@ from .utils import autotune
 @autotune(
     configs=lambda dev: [
         triton.Config({'BV': BV}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in ([2] if dev.blackwell else [2, 4, 8])
+        for num_warps in _warps_h(dev)
         for num_stages in ([2, 3, 4] if dev.shared_mem('ampere') else [2, 1])
         for BV in ([32, 64] if dev.shared_mem('ada') else [32])
     ] + ([

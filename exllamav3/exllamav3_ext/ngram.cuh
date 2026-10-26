@@ -35,3 +35,24 @@ void ngram_dequant
     at::Tensor out,
     bool rotate
 );
+
+void ngram_pq_decode
+(
+    const at::Tensor& packed,
+    const at::Tensor& heads,
+    const at::Tensor& codebooks,
+    at::Tensor out,
+    int64_t K,
+    double scale
+);
+
+void ngram_pq_gather_decode
+(
+    const at::Tensor& table,
+    const at::Tensor& uids,
+    const at::Tensor& heads,
+    const at::Tensor& codebooks,
+    at::Tensor out,
+    int64_t K,
+    double scale
+);

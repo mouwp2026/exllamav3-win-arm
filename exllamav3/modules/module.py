@@ -50,6 +50,37 @@ class Module(ABC):
         self.q_half_bits = True     # may be quantized at a half-integer bitrate (all decode kernels have instances)
         self.layer_idx = None
 
+    def __init_subclass__(cls, **kwargs):
+        # env-gated NVTX attribution; see EXL3_NVTX_MODULES
+        super().__init_subclass__(**kwargs)
+        if not os.environ.get("EXL3_NVTX_MODULES"):
+            return
+        fwd = cls.__dict__.get("forward")
+        if fwd is None or getattr(fwd, "_nvtx_wrapped", False):
+            return
+        import functools
+
+        @functools.wraps(fwd)
+        def _nvtx_forward(self, *args, **kw):
+            tag = getattr(self, "key", None) or cls.__name__
+            pushed = False
+            try:
+                torch.cuda.nvtx.range_push(str(tag)[:120])
+                pushed = True
+            except Exception:
+                pass
+            try:
+                return fwd(self, *args, **kw)
+            finally:
+                if pushed:
+                    try:
+                        torch.cuda.nvtx.range_pop()
+                    except Exception:
+                        pass
+
+        _nvtx_forward._nvtx_wrapped = True
+        cls.forward = _nvtx_forward
+
     def __iter__(self):
         yield self
         for module in self.modules:
