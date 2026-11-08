@@ -320,8 +320,14 @@ namespace {
 
 inline void cpu_pause_()
 {
-#if defined(__aarch64__) || defined(__arm__)  // EXL3_AARCH64_PAUSE
-    asm volatile("yield" ::: "memory");
+#if defined(__aarch64__) || defined(__arm__) || defined(_M_ARM64)  // EXL3_AARCH64_PAUSE
+    #if defined(_MSC_VER)
+        // MSVC (cl.exe and clang-cl) has no inline asm on ARM64; the YIELD hint is the
+        // __yield() intrinsic from <intrin.h>
+        __yield();
+    #else
+        asm volatile("yield" ::: "memory");
+    #endif
 #elif defined(__linux__)
     __builtin_ia32_pause();
 #else

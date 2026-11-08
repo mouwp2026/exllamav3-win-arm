@@ -123,8 +123,12 @@ void run_cpu_reduce_jobs
             }
             if (++spins < 65536)
             {
-                #if defined(__aarch64__) || defined(__arm__)  // EXL3_AARCH64_PAUSE
-                    asm volatile("yield" ::: "memory");
+                #if defined(__aarch64__) || defined(__arm__) || defined(_M_ARM64)  // EXL3_AARCH64_PAUSE
+                    #if defined(_MSC_VER)
+                        __yield();
+                    #else
+                        asm volatile("yield" ::: "memory");
+                    #endif
                 #elif defined(__linux__)
                     __builtin_ia32_pause();
                 #else

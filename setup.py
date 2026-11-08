@@ -77,7 +77,16 @@ if hip:
     extra_cuda_cflags += cuda_flags.hip_include_flags(sources_dir)
 
 # The ROCm extension calls hipBLAS directly (hgemm.cu, graph.cu)
-libraries = ["cublas"] if windows else ["hipblas"] if hip else []
+# Windows: torch 把 CUDA lib/x64 排在 /LIBPATH 前面，链接器会装上 x64 导入库，
+# 导致 ARM64 上报一堆 LNK2001。这里改用绝对路径直接指向 arm64 库绕开搜索顺序。
+cuda_lib_dir = os.path.join(
+    os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH", ""), "lib", "arm64"
+)
+win_cuda_libs = [
+    os.path.join(cuda_lib_dir, n) for n in ("cublas.lib", "cusparse.lib", "cudart.lib")
+] if windows and os.path.isdir(cuda_lib_dir) else []
+libraries = ["cublas", "cusparse", "cudart"] if (windows and not win_cuda_libs) else ["hipblas"] if hip else []
+extra_link_args = win_cuda_libs
 
 setup_kwargs = (
     {
@@ -86,6 +95,7 @@ setup_kwargs = (
                 extension_name,
                 sources,
                 extra_compile_args=extra_compile_args,
+                extra_link_args=extra_link_args,
                 libraries=libraries,
             )
         ],
